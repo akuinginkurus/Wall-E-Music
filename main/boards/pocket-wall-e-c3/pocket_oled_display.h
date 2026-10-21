@@ -11,10 +11,10 @@ public:
                       int height, bool mirror_x, bool mirror_y);
     ~PocketOledDisplay() override;
 
-    void SetupUI() override;
+    void SetupUI();
     void SetStatus(const char* status) override;
     void SetEmotion(const char* emotion) override;
-    void SetChatMessage(const char* role, const char* content) override;
+    void SetChatMessage(const char* role, const char* content);
     void ClearChatMessages() override;
 
 private:
