@@ -30,6 +30,7 @@ set(SOURCES "audio/audio_codec.cc"
             "settings.cc"
             "device_state_machine.cc"
             "assets.cc"
+            "youtube_audio_poller.cc"
             "main.cc"
             )
 
@@ -60,6 +61,10 @@ set(BUILTIN_ICON_FONT font_awesome_14_1)
 # ESP32-C3 INMP441 Board
 if(CONFIG_BOARD_TYPE_ESP32C3_INMP441)
     set(BOARD_TYPE "esp32c3-inmp441")
+elseif(CONFIG_BOARD_TYPE_POCKET_WALL_E_C3)
+    set(BOARD_DIR "pocket-wall-e-c3")
+    set(BOARD_TYPE "pocket-wall-e-c3")
+    set(BOARD_NAME "pocket-wall-e-c3")
 endif()
 
 file(GLOB BOARD_SOURCES
