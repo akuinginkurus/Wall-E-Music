@@ -83,6 +83,13 @@ public:
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
 
+    void ResetAborted() { aborted_ = false; }
+    void CloseAudioChannel() {
+    Schedule([this]() {
+        if (protocol_) protocol_->CloseAudioChannel();
+    });
+}
+
     void AbortSpeaking(AbortReason reason);
 
     /**
