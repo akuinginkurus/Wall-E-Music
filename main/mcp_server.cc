@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "lvgl_theme.h"
 #include "lvgl_display.h"
+#include "youtube_audio_poller.h"
 
 #define TAG "MCP"
 
