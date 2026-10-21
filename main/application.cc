@@ -22,6 +22,13 @@
 
 #define TAG "Application"
 
+namespace {
+std::string ToLowerAscii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return text;
+}
+}  // namespace
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -317,6 +324,7 @@ void Application::HandleActivationDoneEvent() {
     ota_.reset();
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+    YouTubeAudioPoller::GetInstance().Start();
 }
 
 void Application::ActivationTask() {
@@ -529,21 +537,55 @@ void Application::InitializeProtocol() {
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
-                    if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
-                            SetDeviceState(kDeviceStateIdle);
-                        } else {
-                            SetDeviceState(kDeviceStateListening);
-                        }
-                    }
-                });
+    if (youtube_song_requested_ || YouTubeAudioPoller::GetInstance().IsPlaying()) {
+        std::string q = std::move(youtube_song_query_);
+        youtube_song_query_.clear();
+        if (!q.empty()) {
+            YouTubeAudioPoller::GetInstance().PlayQuery(q);
+        }
+        youtube_song_requested_ = false;
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+        }
+        SetDeviceState(kDeviceStateIdle);
+    } else if (GetDeviceState() == kDeviceStateSpeaking) {
+        if (listening_mode_ == kListeningModeManualStop) {
+            SetDeviceState(kDeviceStateIdle);
+        } else {
+            SetDeviceState(kDeviceStateListening);
+        }
+    }
+});
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
                     Schedule([this, display, message = std::string(text->valuestring)]() {
-                        display->SetChatMessage("assistant", message.c_str());
-                    });
+    display->SetChatMessage("user", message.c_str());
+
+    static const std::vector<std::string> play_prefixes = {
+        "tolong putarkan lagu ", "tolong putar lagu ",
+        "tolong putarkan musik ", "tolong putar musik ",
+        "tolong putarkan ", "tolong putar ",
+        "putarkan lagu ", "putar lagu ",
+        "putarkan musik ", "putar musik ",
+        "play song ", "play music "
+    };
+    std::string lower_msg = ToLowerAscii(message);
+    for (const auto& p : play_prefixes) {
+        auto pos = lower_msg.find(p);
+        if (pos == std::string::npos || pos > 15) continue;
+        std::string q = message.substr(pos + p.length());
+        while (!q.empty() && (q.front() == ' ' || q.front() == ':' || q.front() == ',')) q.erase(0, 1);
+        while (!q.empty() && (q.back() == ' ' || q.back() == '.' || q.back() == '?' || q.back() == '!')) q.pop_back();
+        if (!q.empty()) {
+            youtube_song_requested_ = true;
+            youtube_song_query_ = q;
+            ESP_LOGI(TAG, "YouTube song query: \"%s\"", q.c_str());
+            break;
+        }
+    }
+});
                 }
             }
         } else if (strcmp(type->valuestring, "stt") == 0) {
@@ -811,7 +853,9 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
             audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+if (!YouTubeAudioPoller::GetInstance().IsPlaying() && !youtube_song_requested_) {
+    audio_service_.EnableWakeWordDetection(true);
+}
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
