@@ -30,6 +30,23 @@ private:
     int32_t previous_output_ = 0;
     int32_t gain_q12_ = 4096;
 
+void ShowWakeWordStandbyHint() {
+        Settings audio_settings("audio", false);
+        std::string selected = audio_settings.GetString("wake_word", "hijason");
+        if (selected.empty() || (selected != "hijason" && selected != "hilexin" &&
+            selected != "hiesp" && selected != "nihaoxiaozhi")) {
+            Settings xz_settings("xiaozhi", false);
+            selected = xz_settings.GetString("wake_word", "hijason");
+        }
+        const char* label = "Hi Jason";
+        if (selected == "hilexin") label = "Hi Lexin";
+        else if (selected == "hiesp") label = "Hi ESP";
+        else if (selected == "nihaoxiaozhi") label = "Ni Hao Xiaozhi";
+        char hint[64];
+        std::snprintf(hint, sizeof(hint), "Standby, say: %s", label);
+        GetDisplay()->ShowNotification(hint);
+}
+
 public:
     PocketAudioCodec(int sample_rate, gpio_num_t bclk, gpio_num_t ws,
                      gpio_num_t dout, gpio_num_t din)
