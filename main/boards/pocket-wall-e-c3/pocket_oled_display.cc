@@ -6,6 +6,7 @@
 #include <cstring>
 
 namespace {
+
 // An original LVGL implementation inspired by the visual behavior documented by
 // FluxGarage RoboEyes: https://github.com/FluxGarage/RoboEyes
 constexpr uint32_t kAnimationPeriodMs = 40;
@@ -29,12 +30,18 @@ int Ease(int current, int target) {
     }
     return current + std::min(-1, delta / 3);
 }
+
 }  // namespace
 
 PocketOledDisplay::PocketOledDisplay(esp_lcd_panel_io_handle_t panel_io,
                                      esp_lcd_panel_handle_t panel, int width, int height,
                                      bool mirror_x, bool mirror_y)
-    : OledDisplay(panel_io, panel, width, height, mirror_x, mirror_y) {}
+    : OledDisplay(panel_io, panel, width, height, mirror_x, mirror_y) {
+    // OledDisplay's constructor already initializes LVGL and builds the base UI.
+    // Build the Wall-E face on top of it. SetupUI() is not virtual in this repo,
+    // so nothing calls it automatically; call it here exactly once.
+    SetupUI();
+}
 
 PocketOledDisplay::~PocketOledDisplay() {
     if (animation_timer_ != nullptr) {
@@ -52,9 +59,8 @@ PocketOledDisplay::~PocketOledDisplay() {
 }
 
 void PocketOledDisplay::SetupUI() {
-    OledDisplay::SetupUI();
-
     DisplayLockGuard lock(this);
+
     auto* screen = lv_screen_active();
 
     face_layer_ = lv_obj_create(screen);
@@ -78,6 +84,7 @@ void PocketOledDisplay::SetupUI() {
         lv_obj_set_style_bg_opa(eye, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(eye, 8, 0);
     }
+
     for (auto* lid : {left_top_lid_, right_top_lid_, left_bottom_lid_, right_bottom_lid_}) {
         PrepareShape(lid);
         lv_obj_set_style_bg_color(lid, lv_color_black(), 0);
@@ -100,16 +107,17 @@ void PocketOledDisplay::SetupUI() {
 
     ApplyLayout();
     lv_obj_move_foreground(chat_line_);
+
     animation_timer_ = lv_timer_create(AnimationTimerCallback, kAnimationPeriodMs, this);
 }
 
 void PocketOledDisplay::SetStatus(const char* status) {
     OledDisplay::SetStatus(status);
     DisplayLockGuard lock(this);
-
     if (status == nullptr) {
         return;
     }
+
     if (std::strcmp(status, Lang::Strings::LISTENING) == 0) {
         SetFaceMode(FaceMode::kListening);
     } else if (std::strcmp(status, Lang::Strings::SPEAKING) == 0) {
@@ -120,6 +128,7 @@ void PocketOledDisplay::SetStatus(const char* status) {
     } else if (std::strcmp(status, Lang::Strings::STANDBY) == 0) {
         SetFaceMode(FaceMode::kNeutral);
     }
+
     if (!has_chat_text_ && chat_line_ != nullptr) {
         lv_label_set_text(chat_line_, status);
     }
@@ -133,7 +142,6 @@ void PocketOledDisplay::SetEmotion(const char* emotion) {
 
 void PocketOledDisplay::SetChatMessage(const char* role, const char* content) {
     DisplayLockGuard lock(this);
-
     has_chat_text_ = content != nullptr && content[0] != '\0';
     if (chat_line_ != nullptr) {
         lv_label_set_text(chat_line_, has_chat_text_ ? content : "");
@@ -180,6 +188,7 @@ void PocketOledDisplay::UpdateAnimationFrame() {
     if (face_layer_ == nullptr) {
         return;
     }
+
     ++animation_tick_;
 
     constexpr int face_width = 128;
