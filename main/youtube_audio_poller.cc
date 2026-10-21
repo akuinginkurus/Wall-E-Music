@@ -438,8 +438,7 @@ void YouTubeAudioPoller::StreamAudio(const std::string& video_id, const std::str
     if (display != nullptr) {
         display->SetChatMessage("assistant", display_title.c_str());
         display->SetStatus("Memutar Lagu");
-        display->SetEmotion("music");
-        display->SetFaceState(FaceState::Music);
+        display->SetEmotion("happy");
         display->ShowNotification(display_title.c_str(), 5000);
     }
 
@@ -591,8 +590,7 @@ void YouTubeAudioPoller::StreamAudio(const std::string& video_id, const std::str
         try {
             while (running_.load() && !abort_requested_.load()) {
                 int64_t now_us = esp_timer_get_time();
-                bool playback_idle = app.GetAudioService().IsPlaybackIdle();
-
+                bool playback_idle = app.GetAudioService().IsIdle();
                 // Check live Wi-Fi signal periodically without lag
                 if (now_us - last_rssi_check_us > 5000000) {
                     last_rssi_check_us = now_us;
@@ -795,8 +793,7 @@ void YouTubeAudioPoller::StreamAudio(const std::string& video_id, const std::str
                             frames_pushed++;
                             session_frames++;
                             if (frames_pushed == 1 || frames_pushed % 50 == 0) {
-                                ESP_LOGI(TAG, "Audio frame #%d pushed to decoder (len=%u, q_size=%u)",
-                                         frames_pushed, (unsigned int)pkt_len, (unsigned int)app.GetAudioService().GetDecodeQueueSize());
+                                ESP_LOGI(TAG, "Audio frame #%d pushed to decoder (len=%u)", frames_pushed, (unsigned int)pkt_len);
                             }
                         }
 
@@ -845,7 +842,7 @@ void YouTubeAudioPoller::StreamAudio(const std::string& video_id, const std::str
     bool was_aborted = abort_requested_.load();
     if (!was_aborted) {
         int wait_ms = 0;
-        while (!app.GetAudioService().IsPlaybackIdle() && wait_ms < 5000) {
+        while (!app.GetAudioService().IsIdle() && wait_ms < 5000) {
             vTaskDelay(pdMS_TO_TICKS(100));
             wait_ms += 100;
         }
@@ -869,7 +866,6 @@ void YouTubeAudioPoller::StreamAudio(const std::string& video_id, const std::str
             display->SetChatMessage("system", "");
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
-            display->SetFaceState(FaceState::Idle);
         }
     } else {
         ESP_LOGI(TAG, ">> DETEKSI: Lagu YouTube \"%s\" DIHENTIKAN <<", title.c_str());
@@ -879,7 +875,6 @@ void YouTubeAudioPoller::StreamAudio(const std::string& video_id, const std::str
             display->SetChatMessage("system", "");
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
-            display->SetFaceState(FaceState::Idle);
         }
     }
 
