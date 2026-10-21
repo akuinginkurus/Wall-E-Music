@@ -127,7 +127,7 @@ endchoice
 
 choice WAKE_WORD_TYPE
     prompt "Wake Word Implementation Type"
-    default WAKE_WORD_DISABLED
+    default USE_ESP_WAKE_WORD
     help
         Choose the type of wake word implementation to use
 
@@ -141,6 +141,23 @@ choice WAKE_WORD_TYPE
         depends on IDF_TARGET_ESP32C3
         help
             Support ESP32 C3
+endchoice
+
+choice WAKE_WORD_SELECTION
+    prompt "Wake Word Selection"
+    default WAKE_WORD_HI_LEXIN
+    depends on USE_ESP_WAKE_WORD
+    help
+        Select which wake word to use
+
+    config WAKE_WORD_HI_ESP
+        bool "Hi ESP"
+    config WAKE_WORD_HI_JASON
+        bool "Hi Jason"
+    config WAKE_WORD_HI_LEXIN
+        bool "Hi Lexin"
+    config WAKE_WORD_NI_HAO_XIAOZHI
+        bool "Ni Hao Xiaozhi"
 endchoice
 
 config RECEIVE_CUSTOM_MESSAGE
