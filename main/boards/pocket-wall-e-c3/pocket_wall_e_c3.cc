@@ -151,6 +151,12 @@ private:
                                          DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
+void InitializeListeningLed() {
+        gpio_reset_pin(GPIO_NUM_8);
+        ESP_ERROR_CHECK(
+            gpio_set_direction(GPIO_NUM_8, GPIO_MODE_OUTPUT));
+        gpio_set_level(GPIO_NUM_8, 1);
+
     void InitializeButton() {
         action_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
