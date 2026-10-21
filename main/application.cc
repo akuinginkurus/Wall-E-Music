@@ -9,7 +9,10 @@
 #include "mcp_server.h"
 #include "assets.h"
 #include "settings.h"
-
+#include "youtube_audio_poller.h"
+#include <algorithm>
+#include <cctype>
+#include <vector>
 #include <cstring>
 #include <esp_log.h>
 #include <cJSON.h>
