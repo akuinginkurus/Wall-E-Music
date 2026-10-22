@@ -5,6 +5,9 @@
 #include "system_info.h"
 #include "settings.h"
 #include "assets/lang_config.h"
+#include "mode/mode_store.h"
+#include "mode/boot_mode.h"
+#include "youtube_audio_poller.h"
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -23,8 +26,10 @@
 
 static const char *TAG = "WifiBoard";
 
-// Connection timeout in seconds
-static constexpr int CONNECT_TIMEOUT_SEC = 60;
+// Connection timeout in seconds (increased from 15s for weak-signal APs)
+static constexpr int CONNECT_TIMEOUT_SEC = 35;
+// Number of retry attempts before entering config mode
+static constexpr int MAX_CONNECT_RETRIES = 3;
 
 WifiBoard::WifiBoard() {
     // Create connection timeout timer
@@ -88,12 +93,21 @@ void WifiBoard::StartNetwork() {
 }
 
 void WifiBoard::TryWifiConnect() {
+    Settings settings("system", true);
+    if (settings.GetInt("force_wifi_cfg", 0) == 1) {
+        ESP_LOGI(TAG, "force_wifi_cfg flag detected, entering WiFi config mode directly");
+        settings.SetInt("force_wifi_cfg", 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        StartWifiConfigMode();
+        return;
+    }
+
     auto& ssid_manager = SsidManager::GetInstance();
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
     if (have_ssid) {
         // Start connection attempt with timeout
-        ESP_LOGI(TAG, "Starting WiFi connection attempt");
+        ESP_LOGI(TAG, "Starting WiFi connection attempt (retry %d/%d)", connect_retry_count_, MAX_CONNECT_RETRIES);
         esp_timer_start_once(connect_timer_, CONNECT_TIMEOUT_SEC * 1000000ULL);
         WifiManager::GetInstance().StartStation();
     } else {
@@ -109,6 +123,7 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::Connected:
             // Stop timeout timer
             esp_timer_stop(connect_timer_);
+            connect_retry_count_ = 0;  // Reset retry counter on success
 #ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
             // make sure blufi resources has been released
             Blufi::GetInstance().deinit();
@@ -151,10 +166,21 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
-    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
+    auto& ssid_manager = SsidManager::GetInstance();
+    bool have_ssid = !ssid_manager.GetSsidList().empty();
 
-    WifiManager::GetInstance().StopStation();
-    board->StartWifiConfigMode();
+    board->connect_retry_count_++;
+    if (have_ssid) {
+        ESP_LOGW(TAG, "WiFi connection timeout, retrying (%d)...", board->connect_retry_count_);
+        WifiManager::GetInstance().StopStation();
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        board->TryWifiConnect();
+    } else {
+        ESP_LOGW(TAG, "No saved SSID found, entering config mode");
+        board->connect_retry_count_ = 0;
+        WifiManager::GetInstance().StopStation();
+        board->StartWifiConfigMode();
+    }
 }
 
 void WifiBoard::StartWifiConfigMode() {
@@ -200,6 +226,11 @@ void WifiBoard::StartWifiConfigMode() {
 
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
+    if (in_config_mode_ || Application::GetInstance().GetDeviceState() == kDeviceStateWifiConfiguring) {
+        ESP_LOGI(TAG, "Already in WiFi config mode");
+        return;
+    }
+
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
     auto& app = Application::GetInstance();
@@ -212,8 +243,8 @@ void WifiBoard::EnterWifiConfigMode() {
         xTaskCreate([](void* arg) {
             auto* board = static_cast<WifiBoard*>(arg);
 
-            // Wait for 1 second to allow speaking to finish gracefully
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            // Wait for 500ms to allow speaking to finish gracefully
+            vTaskDelay(pdMS_TO_TICKS(500));
 
             // Stop any ongoing connection attempt
             esp_timer_stop(board->connect_timer_);
@@ -224,11 +255,6 @@ void WifiBoard::EnterWifiConfigMode() {
 
             vTaskDelete(NULL);
         }, "wifi_cfg_delay", 4096, this, 2, NULL);
-        return;
-    }
-
-    if (state != kDeviceStateStarting) {
-        ESP_LOGE(TAG, "EnterWifiConfigMode called but device state is not starting or speaking, device state: %d", state);
         return;
     }
 
@@ -308,6 +334,12 @@ std::string WifiBoard::GetDeviceStatusJson() {
     auto audio_speaker = cJSON_CreateObject();
     if (auto codec = board.GetAudioCodec()) {
         cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
+    }
+    auto& yt = YouTubeAudioPoller::GetInstance();
+    cJSON_AddBoolToObject(audio_speaker, "is_playing_music", yt.IsPlaying());
+    if (yt.IsPlaying()) {
+        cJSON_AddStringToObject(audio_speaker, "song_title", yt.GetCurrentTitle().c_str());
+        cJSON_AddStringToObject(audio_speaker, "song_video_id", yt.GetCurrentVideoId().c_str());
     }
     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
 
