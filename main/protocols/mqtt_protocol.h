@@ -17,6 +17,7 @@
 #include <mutex>
 #include <memory>
 #include <atomic>
+#include <deque>
 
 #define MQTT_PING_INTERVAL_SECONDS 90
 #define MQTT_RECONNECT_INTERVAL_MS 60000
@@ -49,6 +50,12 @@ private:
     std::string aes_nonce_;
     std::string udp_server_;
     int udp_port_;
+    struct BufferedPacket {
+        uint32_t seq;
+        std::unique_ptr<AudioStreamPacket> pkt;
+    };
+    std::deque<BufferedPacket> jitter_buffer_;
+    std::mutex jitter_mutex_;
     uint32_t local_sequence_;
     uint32_t remote_sequence_;
     esp_timer_handle_t reconnect_timer_;

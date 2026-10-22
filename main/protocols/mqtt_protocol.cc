@@ -2,9 +2,14 @@
 #include "board.h"
 #include "application.h"
 #include "settings.h"
+#include "youtube_audio_poller.h"
 
 #include <esp_log.h>
 #include <cstring>
+#include <cstdlib>
+#include <cstdint>
+#include <deque>
+#include <algorithm>
 #include <arpa/inet.h>
 #include "assets/lang_config.h"
 
@@ -12,6 +17,7 @@
 
 MqttProtocol::MqttProtocol() {
     event_group_handle_ = xEventGroupCreate();
+    mbedtls_aes_init(&aes_ctx_);
 
     // Initialize reconnect timer
     esp_timer_create_args_t reconnect_timer_args = {
@@ -43,6 +49,7 @@ MqttProtocol::~MqttProtocol() {
         esp_timer_stop(reconnect_timer_);
         esp_timer_delete(reconnect_timer_);
     }
+    mbedtls_aes_free(&aes_ctx_);
 
     udp_.reset();
     mqtt_.reset();
@@ -57,6 +64,14 @@ bool MqttProtocol::Start() {
 }
 
 bool MqttProtocol::StartMqttClient(bool report_error) {
+    if (YouTubeAudioPoller::GetInstance().IsPlaying()) {
+        ESP_LOGI(TAG, "Postponing MQTT connect/reconnect: music is currently playing");
+        if (reconnect_timer_ != nullptr) {
+            esp_timer_start_once(reconnect_timer_, 10000 * 1000);
+        }
+        return false;
+    }
+
     if (mqtt_ != nullptr) {
         ESP_LOGW(TAG, "Mqtt client already started");
         mqtt_.reset();
@@ -67,7 +82,7 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     auto client_id = settings.GetString("client_id");
     auto username = settings.GetString("username");
     auto password = settings.GetString("password");
-    int keepalive_interval = settings.GetInt("keepalive", 240);
+    int keepalive_interval = settings.GetInt("keepalive", 60);
     publish_topic_ = settings.GetString("publish_topic");
 
     if (endpoint.empty()) {
@@ -114,8 +129,9 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             ParseServerHello(root);
         } else if (strcmp(type->valuestring, "goodbye") == 0) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
-            ESP_LOGI(TAG, "Received goodbye message, session_id: %s", session_id ? session_id->valuestring : "null");
-            if (session_id == nullptr || session_id_ == session_id->valuestring) {
+            const char* remote_session_id = cJSON_IsString(session_id) ? session_id->valuestring : "null";
+            ESP_LOGI(TAG, "Received goodbye message, session_id: %s", remote_session_id);
+            if (session_id == nullptr || (cJSON_IsString(session_id) && session_id_ == session_id->valuestring)) {
                 auto alive = alive_;  // Capture alive flag
                 Application::GetInstance().Schedule([this, alive]() {
                     if (*alive) {
@@ -131,15 +147,31 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     });
 
     ESP_LOGI(TAG, "Connecting to endpoint %s", endpoint.c_str());
-    std::string broker_address;
+    std::string broker_address = endpoint;
     int broker_port = 8883;
-    size_t pos = endpoint.find(':');
-    if (pos != std::string::npos) {
-        broker_address = endpoint.substr(0, pos);
-        broker_port = std::stoi(endpoint.substr(pos + 1));
-    } else {
-        broker_address = endpoint;
+    std::string endpoint_host = endpoint;
+    size_t scheme_pos = endpoint_host.find("://");
+    if (scheme_pos != std::string::npos) {
+        endpoint_host = endpoint_host.substr(scheme_pos + 3);
     }
+    size_t colon_pos = endpoint_host.rfind(':');
+    if (colon_pos != std::string::npos) {
+        std::string host_part = endpoint_host.substr(0, colon_pos);
+        const auto port_text = endpoint_host.substr(colon_pos + 1);
+        char* end_ptr = nullptr;
+        long parsed_port = std::strtol(port_text.c_str(), &end_ptr, 10);
+        if (end_ptr != port_text.c_str() && end_ptr != nullptr && *end_ptr == '\0' &&
+            parsed_port > 0 && parsed_port <= 65535) {
+            broker_address = host_part;
+            broker_port = static_cast<int>(parsed_port);
+        } else {
+            ESP_LOGW(TAG, "Invalid MQTT endpoint port: %s, fallback to %d", port_text.c_str(), broker_port);
+            broker_address = endpoint_host;
+        }
+    } else {
+        broker_address = endpoint_host;
+    }
+    ESP_LOGI(TAG, "MQTT connect target: host=%s, port=%d", broker_address.c_str(), broker_port);
     if (!mqtt_->Connect(broker_address, broker_port, client_id, username, password)) {
         ESP_LOGE(TAG, "Failed to connect to endpoint, code=%d", mqtt_->GetLastError());
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
@@ -167,11 +199,22 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     if (udp_ == nullptr) {
         return false;
     }
+    if (aes_nonce_.size() < 16) {
+        ESP_LOGE(TAG, "Invalid AES nonce length: %u", static_cast<unsigned>(aes_nonce_.size()));
+        return false;
+    }
+    if (packet->payload.size() > UINT16_MAX) {
+        ESP_LOGE(TAG, "Audio payload too large: %u", static_cast<unsigned>(packet->payload.size()));
+        return false;
+    }
 
-    std::string nonce(aes_nonce_);
-    *(uint16_t*)&nonce[2] = htons(packet->payload.size());
-    *(uint32_t*)&nonce[8] = htonl(packet->timestamp);
-    *(uint32_t*)&nonce[12] = htonl(++local_sequence_);
+    std::string nonce(aes_nonce_.data(), 16);
+    uint16_t net_payload_size = htons(static_cast<uint16_t>(packet->payload.size()));
+    uint32_t net_timestamp = htonl(packet->timestamp);
+    uint32_t net_sequence = htonl(++local_sequence_);
+    memcpy(&nonce[2], &net_payload_size, sizeof(net_payload_size));
+    memcpy(&nonce[8], &net_timestamp, sizeof(net_timestamp));
+    memcpy(&nonce[12], &net_sequence, sizeof(net_sequence));
 
     std::string encrypted;
     encrypted.resize(aes_nonce_.size() + packet->payload.size());
@@ -233,28 +276,38 @@ bool MqttProtocol::OpenAudioChannel() {
     std::lock_guard<std::mutex> lock(channel_mutex_);
     auto network = Board::GetInstance().GetNetwork();
     udp_ = network->CreateUdp(2);
+    // Simple jitter buffer to reorder small gaps
+    static constexpr size_t kJitterBufferSize = 5;
+
     udp_->OnMessage([this](const std::string& data) {
         /*
          * UDP Encrypted OPUS Packet Format:
          * |type 1u|flags 1u|payload_len 2u|ssrc 4u|timestamp 4u|sequence 4u|
          * |payload payload_len|
          */
-        if (data.size() < sizeof(aes_nonce_)) {
-            ESP_LOGE(TAG, "Invalid audio packet size: %u", data.size());
+        if (data.size() < aes_nonce_.size()) {
+            ESP_LOGE(TAG, "Invalid audio packet size: %u", static_cast<unsigned>(data.size()));
             return;
         }
         if (data[0] != 0x01) {
             ESP_LOGE(TAG, "Invalid audio packet type: %x", data[0]);
             return;
         }
-        uint32_t timestamp = ntohl(*(uint32_t*)&data[8]);
-        uint32_t sequence = ntohl(*(uint32_t*)&data[12]);
+        uint32_t net_timestamp = 0;
+        uint32_t net_sequence = 0;
+        memcpy(&net_timestamp, data.data() + 8, sizeof(net_timestamp));
+        memcpy(&net_sequence, data.data() + 12, sizeof(net_sequence));
+        uint32_t timestamp = ntohl(net_timestamp);
+        uint32_t sequence = ntohl(net_sequence);
         if (sequence < remote_sequence_) {
-            ESP_LOGW(TAG, "Received audio packet with old sequence: %lu, expected: %lu", sequence, remote_sequence_);
+            // drop old packet silently
             return;
         }
         if (sequence != remote_sequence_ + 1) {
-            ESP_LOGW(TAG, "Received audio packet with wrong sequence: %lu, expected: %lu", sequence, remote_sequence_ + 1);
+            uint32_t gap = (sequence > remote_sequence_) ? sequence - (remote_sequence_ + 1) : 0;
+            if (gap > 5) {
+                ESP_LOGW(TAG, "Received audio packet with wrong sequence: %lu, expected: %lu", sequence, remote_sequence_ + 1);
+            }
         }
 
         size_t decrypted_size = data.size() - aes_nonce_.size();
@@ -272,14 +325,45 @@ bool MqttProtocol::OpenAudioChannel() {
             ESP_LOGE(TAG, "Failed to decrypt audio data, ret: %d", ret);
             return;
         }
-        if (on_incoming_audio_ != nullptr) {
-            on_incoming_audio_(std::move(packet));
+        {
+            std::lock_guard<std::mutex> lock(jitter_mutex_);
+            // Jitter buffer: push, then emit in order while contiguous
+            jitter_buffer_.push_back(BufferedPacket{sequence, std::move(packet)});
+            // sort by sequence
+            std::sort(jitter_buffer_.begin(), jitter_buffer_.end(),
+                      [](const BufferedPacket& a, const BufferedPacket& b) { return a.seq < b.seq; });
+
+            while (!jitter_buffer_.empty()) {
+                auto& front = jitter_buffer_.front();
+                if (remote_sequence_ == 0 || front.seq == remote_sequence_ + 1) {
+                    if (on_incoming_audio_ != nullptr) {
+                        on_incoming_audio_(std::move(front.pkt));
+                    }
+                    remote_sequence_ = front.seq;
+                    jitter_buffer_.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            // Cap buffer size: flush oldest
+            while (jitter_buffer_.size() > kJitterBufferSize) {
+                auto front = std::move(jitter_buffer_.front());
+                jitter_buffer_.pop_front();
+                if (on_incoming_audio_ != nullptr) {
+                    on_incoming_audio_(std::move(front.pkt));
+                }
+                remote_sequence_ = front.seq;
+            }
         }
-        remote_sequence_ = sequence;
         last_incoming_time_ = std::chrono::steady_clock::now();
     });
 
     udp_->Connect(udp_server_, udp_port_);
+
+    // Mark channel as fresh so IsAudioChannelOpened() does not instantly fail
+    // before the first downstream audio packet arrives.
+    last_incoming_time_ = std::chrono::steady_clock::now();
 
     if (on_audio_channel_opened_ != nullptr) {
         on_audio_channel_opened_();
@@ -314,8 +398,9 @@ std::string MqttProtocol::GetHelloMessage() {
 
 void MqttProtocol::ParseServerHello(const cJSON* root) {
     auto transport = cJSON_GetObjectItem(root, "transport");
-    if (transport == nullptr || strcmp(transport->valuestring, "udp") != 0) {
-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+    if (!cJSON_IsString(transport) || transport->valuestring == nullptr ||
+        strcmp(transport->valuestring, "udp") != 0) {
+        ESP_LOGE(TAG, "Unsupported transport in MQTT hello");
         return;
     }
 
@@ -343,16 +428,38 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
         ESP_LOGE(TAG, "UDP is not specified");
         return;
     }
-    udp_server_ = cJSON_GetObjectItem(udp, "server")->valuestring;
-    udp_port_ = cJSON_GetObjectItem(udp, "port")->valueint;
-    auto key = cJSON_GetObjectItem(udp, "key")->valuestring;
-    auto nonce = cJSON_GetObjectItem(udp, "nonce")->valuestring;
+    auto server = cJSON_GetObjectItem(udp, "server");
+    auto port = cJSON_GetObjectItem(udp, "port");
+    auto key = cJSON_GetObjectItem(udp, "key");
+    auto nonce = cJSON_GetObjectItem(udp, "nonce");
+    if (!cJSON_IsString(server) || server->valuestring == nullptr ||
+        !cJSON_IsNumber(port) ||
+        !cJSON_IsString(key) || key->valuestring == nullptr ||
+        !cJSON_IsString(nonce) || nonce->valuestring == nullptr) {
+        ESP_LOGE(TAG, "Invalid UDP config in MQTT hello");
+        return;
+    }
+    udp_server_ = server->valuestring;
+    udp_port_ = port->valueint;
+    if (udp_port_ <= 0 || udp_port_ > 65535) {
+        ESP_LOGE(TAG, "Invalid UDP port in MQTT hello: %d", udp_port_);
+        return;
+    }
 
     // auto encryption = cJSON_GetObjectItem(udp, "encryption")->valuestring;
     // ESP_LOGI(TAG, "UDP server: %s, port: %d, encryption: %s", udp_server_.c_str(), udp_port_, encryption);
-    aes_nonce_ = DecodeHexString(nonce);
-    mbedtls_aes_init(&aes_ctx_);
-    mbedtls_aes_setkey_enc(&aes_ctx_, (const unsigned char*)DecodeHexString(key).c_str(), 128);
+    auto decoded_nonce = DecodeHexString(nonce->valuestring);
+    auto decoded_key = DecodeHexString(key->valuestring);
+    if (decoded_nonce.size() < 16 || decoded_key.size() != 16) {
+        ESP_LOGE(TAG, "Invalid UDP key/nonce size in MQTT hello");
+        return;
+    }
+    aes_nonce_.assign(decoded_nonce.data(), 16);
+    if (mbedtls_aes_setkey_enc(&aes_ctx_, (const unsigned char*)decoded_key.data(), 128) != 0) {
+        ESP_LOGE(TAG, "Failed to set AES key from MQTT hello");
+        return;
+    }
+
     local_sequence_ = 0;
     remote_sequence_ = 0;
     xEventGroupSetBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
@@ -368,6 +475,11 @@ static inline uint8_t CharToHex(char c) {
 }
 
 std::string MqttProtocol::DecodeHexString(const std::string& hex_string) {
+    if ((hex_string.size() % 2) != 0) {
+        ESP_LOGW(TAG, "Invalid hex string length: %u", static_cast<unsigned>(hex_string.size()));
+        return {};
+    }
+
     std::string decoded;
     decoded.reserve(hex_string.size() / 2);
     for (size_t i = 0; i < hex_string.size(); i += 2) {
