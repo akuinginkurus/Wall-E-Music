@@ -1,6 +1,11 @@
 #include "audio_service.h"
+#include "youtube_audio_poller.h"
+#include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <new>
 
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "processors/afe_audio_processor.h"
@@ -75,7 +80,8 @@ void AudioService::Initialize(AudioCodec* codec) {
 
 void AudioService::Start() {
     service_stopped_ = false;
-    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_LOOPBACK_RUNNING);
 
     esp_timer_start_periodic(audio_power_timer_, 1000000);
 
@@ -122,7 +128,8 @@ void AudioService::Stop() {
     service_stopped_ = true;
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
         AS_EVENT_WAKE_WORD_RUNNING |
-        AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+        AS_EVENT_AUDIO_PROCESSOR_RUNNING |
+        AS_EVENT_LOOPBACK_RUNNING);
 
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     audio_encode_queue_.clear();
@@ -161,9 +168,10 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
                 data[j + 1] = resampled_reference[i];
             }
         } else {
-            auto resampled = std::vector<int16_t>(input_resampler_.GetOutputSamples(data.size()));
-            input_resampler_.Process(data.data(), data.size(), resampled.data());
-            data = std::move(resampled);
+            int out_samples = input_resampler_.GetOutputSamples(data.size());
+            input_resample_buf_.resize(out_samples);
+            input_resampler_.Process(data.data(), data.size(), input_resample_buf_.data());
+            data = input_resample_buf_;
         }
     } else {
         data.resize(samples * codec_->input_channels());
@@ -190,7 +198,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
 void AudioService::AudioInputTask() {
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
-            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING,
+            AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_LOOPBACK_RUNNING,
             pdFALSE, pdFALSE, portMAX_DELAY);
 
         if (service_stopped_) {
@@ -199,6 +207,90 @@ void AudioService::AudioInputTask() {
         if (audio_input_need_warmup_) {
             audio_input_need_warmup_ = false;
             vTaskDelay(pdMS_TO_TICKS(120));
+            continue;
+        }
+
+        /* Live monitor (mic -> speaker) */
+        if (bits & AS_EVENT_LOOPBACK_RUNNING) {
+            std::vector<int16_t> data;
+            const int input_sample_rate = codec_->input_sample_rate();
+            int samples = OPUS_FRAME_DURATION_MS * input_sample_rate / 1000;
+            if (ReadAudioData(data, input_sample_rate, samples)) {
+                // If input channels is 2, use the left channel
+                if (codec_->input_channels() == 2) {
+                    auto mono_data = std::vector<int16_t>(data.size() / 2);
+                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
+                        mono_data[i] = data[j];
+                    }
+                    data = std::move(mono_data);
+                }
+
+                // Resample to output sample rate if needed
+                if (codec_->output_sample_rate() != input_sample_rate) {
+                    int target_size = output_resampler_.GetOutputSamples(data.size());
+                    std::vector<int16_t> resampled(target_size);
+                    output_resampler_.Process(data.data(), data.size(), resampled.data());
+                    data = std::move(resampled);
+                }
+
+                // Simple low-pass filter + adaptive gain to suppress feedback
+                const float lpf_alpha = 0.35f;
+                float y = loopback_filter_state_;
+                int32_t peak = 0;
+                for (size_t i = 0; i < data.size(); ++i) {
+                    y += lpf_alpha * (static_cast<float>(data[i]) - y);
+                    int32_t v = static_cast<int32_t>(y);
+                    if (v > std::numeric_limits<int16_t>::max()) {
+                        v = std::numeric_limits<int16_t>::max();
+                    } else if (v < std::numeric_limits<int16_t>::min()) {
+                        v = std::numeric_limits<int16_t>::min();
+                    }
+                    data[i] = static_cast<int16_t>(v);
+                    int32_t abs_v = v >= 0 ? v : -v;
+                    if (abs_v > peak) {
+                        peak = abs_v;
+                    }
+                }
+                loopback_filter_state_ = y;
+
+                if (peak > 12000) {
+                    loopback_dynamic_gain_ *= 0.6f;
+                } else if (peak < 3000 && loopback_dynamic_gain_ < 1.0f) {
+                    loopback_dynamic_gain_ += 0.02f;
+                }
+                if (loopback_dynamic_gain_ < 0.2f) {
+                    loopback_dynamic_gain_ = 0.2f;
+                } else if (loopback_dynamic_gain_ > 1.0f) {
+                    loopback_dynamic_gain_ = 1.0f;
+                }
+
+                const float effective_gain = loopback_gain_ * loopback_dynamic_gain_;
+                if (effective_gain != 1.0f) {
+                    const int32_t max_sample = std::numeric_limits<int16_t>::max();
+                    const int32_t min_sample = std::numeric_limits<int16_t>::min();
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        int32_t amplified = static_cast<int32_t>(data[i] * effective_gain);
+                        if (amplified > max_sample) {
+                            data[i] = static_cast<int16_t>(max_sample);
+                        } else if (amplified < min_sample) {
+                            data[i] = static_cast<int16_t>(min_sample);
+                        } else {
+                            data[i] = static_cast<int16_t>(amplified);
+                        }
+                    }
+                }
+
+                // Push to playback queue (drop if queue is full to keep latency low)
+                std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+                if (audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+                    auto task = std::make_unique<AudioTask>();
+                    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+                    task->timestamp = 0;
+                    task->pcm = std::move(data);
+                    audio_playback_queue_.push_back(std::move(task));
+                    audio_queue_cv_.notify_all();
+                }
+            }
             continue;
         }
 
@@ -249,8 +341,11 @@ void AudioService::AudioInputTask() {
             }
         }
 
-        ESP_LOGE(TAG, "Should not be here, bits: %lx", bits);
-        break;
+        // The state task can switch from wake-word detection to voice
+        // processing between xEventGroupWaitBits() and this point. Retry the
+        // wait instead of terminating the only audio-input task.
+        ESP_LOGD(TAG, "Audio input mode changed while processing bits: %lx", bits);
+        vTaskDelay(1);
     }
 
     ESP_LOGW(TAG, "Audio input task stopped");
@@ -266,6 +361,7 @@ void AudioService::AudioOutputTask() {
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
+        output_in_flight_ = true;
         audio_queue_cv_.notify_all();
         lock.unlock();
 
@@ -280,13 +376,15 @@ void AudioService::AudioOutputTask() {
         last_output_time_ = std::chrono::steady_clock::now();
         debug_statistics_.playback_count++;
 
+        lock.lock();
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
         if (task->timestamp > 0) {
-            lock.lock();
             timestamp_queue_.push_back(task->timestamp);
         }
 #endif
+        output_in_flight_ = false;
+        audio_queue_cv_.notify_all();
     }
 
     ESP_LOGW(TAG, "Audio output task stopped");
@@ -308,30 +406,43 @@ void AudioService::OpusCodecTask() {
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
+            decode_in_flight_ = true;
             audio_queue_cv_.notify_all();
             lock.unlock();
 
-            auto task = std::make_unique<AudioTask>();
-            task->type = kAudioTaskTypeDecodeToPlaybackQueue;
-            task->timestamp = packet->timestamp;
+            std::unique_ptr<AudioTask> task;
+            bool decoded = false;
+            try {
+                task = std::make_unique<AudioTask>();
+                task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+                task->timestamp = packet->timestamp;
 
-            SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
-            if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
-                // Resample if the sample rate is different
-                if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
-                    int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
-                    std::vector<int16_t> resampled(target_size);
-                    output_resampler_.Process(task->pcm.data(), task->pcm.size(), resampled.data());
-                    task->pcm = std::move(resampled);
+                SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+                if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
+                    // Resample if the sample rate is different
+                    if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
+                        int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
+                        std::vector<int16_t> resampled(target_size);
+                        output_resampler_.Process(task->pcm.data(), task->pcm.size(), resampled.data());
+                        task->pcm = std::move(resampled);
+                    }
+                    decoded = true;
+                } else {
+                    ESP_LOGE(TAG, "Failed to decode audio");
                 }
-
-                lock.lock();
-                audio_playback_queue_.push_back(std::move(task));
-                audio_queue_cv_.notify_all();
-            } else {
-                ESP_LOGE(TAG, "Failed to decode audio");
-                lock.lock();
+            } catch (const std::bad_alloc&) {
+                ESP_LOGE(TAG,
+                         "Out of memory while decoding audio; dropping frame (free=%u, largest=%u)",
+                         static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
             }
+
+            lock.lock();
+            if (decoded) {
+                audio_playback_queue_.push_back(std::move(task));
+            }
+            decode_in_flight_ = false;
+            audio_queue_cv_.notify_all();
             debug_statistics_.decode_count++;
         }
         
@@ -372,12 +483,21 @@ void AudioService::OpusCodecTask() {
 }
 
 void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
-    if (opus_decoder_->sample_rate() == sample_rate && opus_decoder_->duration_ms() == frame_duration) {
+#if CONFIG_IDF_TARGET_ESP32C3
+    // On ESP32-C3 (no PSRAM), the Opus decoder is allocated once at boot matching codec_->output_sample_rate().
+    // Opus natively decodes any Opus stream (16k, 24k, 48k, any frame duration) directly to output_sample_rate.
+    // Reallocating the 18KB decoder at runtime causes heap exhaustion (OPUS_ALLOC_FAIL -7) while WakeNet is active.
+    if (opus_decoder_ != nullptr) {
+        return;
+    }
+#endif
+
+    if (opus_decoder_ && opus_decoder_->sample_rate() == sample_rate && opus_decoder_->duration_ms() == frame_duration) {
         return;
     }
 
-    opus_decoder_.reset();
-    opus_decoder_ = std::make_unique<OpusDecoderWrapper>(sample_rate, 1, frame_duration);
+    auto new_decoder = std::make_unique<OpusDecoderWrapper>(sample_rate, 1, frame_duration);
+    opus_decoder_ = std::move(new_decoder);
 
     auto codec = Board::GetInstance().GetAudioCodec();
     if (opus_decoder_->sample_rate() != codec->output_sample_rate()) {
@@ -423,6 +543,11 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
     return true;
 }
 
+size_t AudioService::GetDecodeQueueSize() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return audio_decode_queue_.size();
+}
+
 std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     if (audio_send_queue_.empty()) {
@@ -431,6 +556,9 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
     auto packet = std::move(audio_send_queue_.front());
     audio_send_queue_.pop_front();
     audio_queue_cv_.notify_all();
+    if (audio_send_queue_.size() > 0) {
+        ESP_LOGD(TAG, "audio_send_queue remaining %zu", audio_send_queue_.size());
+    }
     return packet;
 }
 
@@ -441,10 +569,14 @@ void AudioService::EncodeWakeWord() {
 }
 
 const std::string& AudioService::GetLastWakeWord() const {
-    return wake_word_->GetLastDetectedWakeWord();
+    static const std::string empty;
+    return wake_word_ ? wake_word_->GetLastDetectedWakeWord() : empty;
 }
 
 std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
+    if (!wake_word_) {
+        return nullptr;
+    }
     auto packet = std::make_unique<AudioStreamPacket>();
     if (wake_word_->GetWakeWordOpus(packet->payload)) {
         return packet;
@@ -457,20 +589,39 @@ void AudioService::EnableWakeWordDetection(bool enable) {
         return;
     }
 
+    if (enable && YouTubeAudioPoller::GetInstance().IsPlaying()) {
+        ESP_LOGD(TAG, "Cannot enable wake word detection: YouTube is playing/active");
+        return;
+    }
+
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
         if (!wake_word_initialized_) {
             if (!wake_word_->Initialize(codec_, models_list_)) {
-                ESP_LOGE(TAG, "Failed to initialize wake word");
-                return;
+                // If temporary heap fragmentation prevented allocation, wait 200ms for idle task/lwIP to cleanup and retry
+                vTaskDelay(pdMS_TO_TICKS(200));
+                if (!wake_word_->Initialize(codec_, models_list_)) {
+                    ESP_LOGE(TAG, "Failed to initialize wake word");
+                    return;
+                }
             }
             wake_word_initialized_ = true;
         }
         wake_word_->Start();
+        // Pastikan input mic hidup agar wake word tetap bisa terdengar di idle.
+        codec_->EnableInput(true);
+        last_input_time_ = std::chrono::steady_clock::now();
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
         xEventGroupSetBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
     } else {
-        wake_word_->Stop();
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        wake_word_->Stop();
+#if CONFIG_IDF_TARGET_ESP32C3
+        // ESP32-C3 has no PSRAM. Release the ~25 KB WakeNet runtime while a
+        // network audio session is active, then recreate it on the next idle.
+        wake_word_initialized_ = false;
+#endif
     }
 }
 
@@ -504,6 +655,31 @@ void AudioService::EnableAudioTesting(bool enable) {
         audio_decode_queue_ = std::move(audio_testing_queue_);
         audio_queue_cv_.notify_all();
     }
+}
+
+void AudioService::EnableLoopback(bool enable) {
+    ESP_LOGI(TAG, "%s loopback", enable ? "Enabling" : "Disabling");
+    if (enable) {
+        if (codec_->output_sample_rate() != codec_->input_sample_rate()) {
+            output_resampler_.Configure(codec_->input_sample_rate(), codec_->output_sample_rate());
+        }
+        loopback_dynamic_gain_ = 1.0f;
+        loopback_filter_state_ = 0.0f;
+        ResetDecoder();
+        xEventGroupSetBits(event_group_, AS_EVENT_LOOPBACK_RUNNING);
+    } else {
+        xEventGroupClearBits(event_group_, AS_EVENT_LOOPBACK_RUNNING);
+    }
+}
+
+void AudioService::SetLoopbackGain(float gain) {
+    if (gain < 0.5f) {
+        gain = 0.5f;
+    } else if (gain > 4.0f) {
+        gain = 4.0f;
+    }
+    loopback_gain_ = gain;
+    ESP_LOGI(TAG, "Set loopback gain to %.2f", loopback_gain_);
 }
 
 void AudioService::EnableDeviceAec(bool enable) {
@@ -621,7 +797,23 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+    return audio_encode_queue_.empty() && audio_decode_queue_.empty() &&
+        audio_playback_queue_.empty() && audio_testing_queue_.empty() &&
+        !decode_in_flight_ && !output_in_flight_;
+}
+
+bool AudioService::IsPlaybackIdle() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
+        !decode_in_flight_ && !output_in_flight_;
+}
+
+bool AudioService::WaitForPlaybackIdle(uint32_t timeout_ms) {
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    return audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
+        return audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
+            !decode_in_flight_ && !output_in_flight_;
+    });
 }
 
 void AudioService::ResetDecoder() {
@@ -660,6 +852,16 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
     } else {
         wake_word_ = nullptr;
     }
+#elif CONFIG_IDF_TARGET_ESP32C3
+#if !defined(CONFIG_WAKE_WORD_DISABLED) || !CONFIG_WAKE_WORD_DISABLED
+    if (esp_srmodel_filter(models_list_, ESP_WN_PREFIX, NULL) != nullptr) {
+        wake_word_ = std::make_unique<EspWakeWord>();
+    } else {
+        wake_word_ = nullptr;
+    }
+#else
+    wake_word_ = nullptr;
+#endif
 #else
     if (esp_srmodel_filter(models_list_, ESP_WN_PREFIX, NULL) != nullptr) {
         wake_word_ = std::make_unique<EspWakeWord>();

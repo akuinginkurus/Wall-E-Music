@@ -37,20 +37,27 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
+#if CONFIG_IDF_TARGET_ESP32C3
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 1
+#define MAX_DECODE_PACKETS_IN_QUEUE 8
+#define MAX_SEND_PACKETS_IN_QUEUE 3
+#else
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 2
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+#endif
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
 
-#define AUDIO_POWER_TIMEOUT_MS 15000
-#define AUDIO_POWER_CHECK_INTERVAL_MS 1000
+#define AUDIO_POWER_TIMEOUT_MS 30000
+#define AUDIO_POWER_CHECK_INTERVAL_MS 500
 
 
 #define AS_EVENT_AUDIO_TESTING_RUNNING      (1 << 0)
 #define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
 #define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
 #define AS_EVENT_PLAYBACK_NOT_EMPTY         (1 << 3)
+#define AS_EVENT_LOOPBACK_RUNNING           (1 << 4)
 
 struct AudioServiceCallbacks {
     std::function<void(void)> on_send_queue_available;
@@ -92,21 +99,28 @@ public:
     const std::string& GetLastWakeWord() const;
     bool IsVoiceDetected() const { return voice_detected_; }
     bool IsIdle();
+    bool IsPlaybackIdle();
     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
+    bool IsAudioTesting() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_TESTING_RUNNING; }
+    bool IsLoopbackRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_LOOPBACK_RUNNING; }
     bool IsAfeWakeWord();
 
     void EnableWakeWordDetection(bool enable);
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
+    void EnableLoopback(bool enable);
+    void SetLoopbackGain(float gain);
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    size_t GetDecodeQueueSize();
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+    bool WaitForPlaybackIdle(uint32_t timeout_ms);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
@@ -121,6 +135,7 @@ private:
     OpusResampler input_resampler_;
     OpusResampler reference_resampler_;
     OpusResampler output_resampler_;
+    std::vector<int16_t> input_resample_buf_;
     DebugStatistics debug_statistics_;
     srmodel_list_t* models_list_ = nullptr;
 
@@ -137,6 +152,8 @@ private:
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
+    bool decode_in_flight_ = false;
+    bool output_in_flight_ = false;
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
@@ -145,6 +162,9 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+    float loopback_gain_ = 1.0f;
+    float loopback_dynamic_gain_ = 1.0f;
+    float loopback_filter_state_ = 0.0f;
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
