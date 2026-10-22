@@ -18,6 +18,8 @@
 #include <vector>
 #include <sstream>
 #include <algorithm>
+#include <cstdlib>
+#include <climits>
 
 #define TAG "Ota"
 
@@ -53,6 +55,7 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     auto& board = Board::GetInstance();
     auto network = board.GetNetwork();
     auto http = network->CreateHttp(0);
+    http->SetTimeout(45000);
     auto user_agent = SystemInfo::GetUserAgent();
     http->SetHeader("Activation-Version", has_serial_number_ ? "2" : "1");
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
@@ -378,7 +381,24 @@ std::vector<int> Ota::ParseVersion(const std::string& version) {
     std::string segment;
     
     while (std::getline(ss, segment, '.')) {
-        versionNumbers.push_back(std::stoi(segment));
+        if (segment.empty()) {
+            versionNumbers.push_back(0);
+            continue;
+        }
+
+        char* end_ptr = nullptr;
+        long value = std::strtol(segment.c_str(), &end_ptr, 10);
+        if (end_ptr == segment.c_str()) {
+            ESP_LOGW(TAG, "Invalid version segment '%s' in '%s', using 0", segment.c_str(), version.c_str());
+            versionNumbers.push_back(0);
+            continue;
+        }
+        if (value < 0) {
+            value = 0;
+        } else if (value > INT_MAX) {
+            value = INT_MAX;
+        }
+        versionNumbers.push_back(static_cast<int>(value));
     }
     
     return versionNumbers;

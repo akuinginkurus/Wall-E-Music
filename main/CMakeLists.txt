@@ -3,6 +3,7 @@ set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
             "audio/codecs/no_audio_codec.cc"
             "audio/codecs/dummy_audio_codec.cc"
+            "audio/codecs/es8311_audio_codec.cc"
             "audio/processors/audio_debugger.cc"
             "led/single_led.cc"
             "led/circular_strip.cc"
@@ -28,13 +29,20 @@ set(SOURCES "audio/audio_codec.cc"
             "application.cc"
             "ota.cc"
             "settings.cc"
+            "settings_manager.cc"
+            "web_settings_server.cc"
+            "battery_monitor.cc"
+            "sleep_manager.cc"
+            "cellular_module.cc"
             "device_state_machine.cc"
             "assets.cc"
+            "mode/mode_store.cc"
+            "mode/mode_selector.cc"
             "youtube_audio_poller.cc"
             "main.cc"
             )
 
-set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols")
+set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "protocols" "mode" "chronchi")
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc)
@@ -58,13 +66,32 @@ endfunction()
 set(BUILTIN_TEXT_FONT font_puhui_14_1)
 set(BUILTIN_ICON_FONT font_awesome_14_1)
 
+# Optional extra files added into default assets.bin.
+# By default, keep local custom media under scripts/spiffs_assets/music.
+if(NOT DEFINED DEFAULT_ASSETS_EXTRA_FILES AND NOT CONFIG_CHRONCHI_RECOVERY_OTA)
+    set(DEFAULT_ASSETS_EXTRA_FILES "${PROJECT_DIR}/scripts/spiffs_assets/music")
+endif()
+if(NOT EXISTS "${DEFAULT_ASSETS_EXTRA_FILES}")
+    unset(DEFAULT_ASSETS_EXTRA_FILES)
+endif()
+
 # ESP32-C3 INMP441 Board
 if(CONFIG_BOARD_TYPE_ESP32C3_INMP441)
     set(BOARD_TYPE "esp32c3-inmp441")
-elseif(CONFIG_BOARD_TYPE_POCKET_WALL_E_C3)
-    set(BOARD_DIR "pocket-wall-e-c3")
-    set(BOARD_TYPE "pocket-wall-e-c3")
-    set(BOARD_NAME "pocket-wall-e-c3")
+endif()
+
+# Native Chronchi is intentionally gated so unrelated targets do not compile or
+# link ESP-NimBLE and the ESP32-C3-specific mode implementation.
+if(CONFIG_ENABLE_CHRONCHI_MODE)
+    list(APPEND SOURCES
+        "chronchi/chronchi_state.cc"
+        "chronchi/chronchi_protocol.cc"
+        "chronchi/chronos_protocol.cc"
+        "chronchi/chronchi_ota.cc"
+        "chronchi/chronchi_ble.cc"
+        "chronchi/chronchi_alert.cc"
+        "chronchi/chronchi_mode.cc"
+    )
 endif()
 
 file(GLOB BOARD_SOURCES
@@ -195,7 +222,15 @@ idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
+                    PRIV_REQUIRES json esp_psram spi_flash esp_app_format app_update efuse bt mbedtls
                     )
+
+# Use the ESP-IDF-provided python path when available to avoid PATH issues.
+if(DEFINED PYTHON)
+    set(PYTHON_CMD "${PYTHON}")
+else()
+    set(PYTHON_CMD python)
+endif()
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE
@@ -210,7 +245,7 @@ target_compile_definitions(${COMPONENT_LIB}
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
-    COMMAND python ${PROJECT_DIR}/scripts/gen_lang.py
+    COMMAND ${PYTHON_CMD} ${PROJECT_DIR}/scripts/gen_lang.py
             --language "${LANG_DIR}"
             --output "${LANG_HEADER}"
     DEPENDS
@@ -268,7 +303,7 @@ function(build_default_assets_bin)
     # Create custom command to build assets
     add_custom_command(
         OUTPUT ${GENERATED_ASSETS_BIN}
-        COMMAND python ${PROJECT_DIR}/scripts/build_default_assets.py ${BUILD_ARGS}
+        COMMAND ${PYTHON_CMD} ${PROJECT_DIR}/scripts/build_default_assets.py ${BUILD_ARGS}
         DEPENDS
             ${SDKCONFIG}
             ${PROJECT_DIR}/scripts/build_default_assets.py

@@ -65,6 +65,8 @@ public:
 
     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
+    bool IsWifiResetConfirmationPending();
+    bool IsStandbyActive() const { return esp_timer_get_time() < standby_until_us_; }
     
     /**
      * Request state transition
@@ -82,13 +84,6 @@ public:
      */
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
-
-    void ResetAborted() { aborted_ = false; }
-    void CloseAudioChannel() {
-    Schedule([this]() {
-        if (protocol_) protocol_->CloseAudioChannel();
-    });
-}
 
     void AbortSpeaking(AbortReason reason);
 
@@ -119,6 +114,10 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    Protocol* GetProtocol() { return protocol_.get(); }
+    void CloseAudioChannel();
+    bool IsAborted() const { return aborted_; }
+    void ResetAborted() { aborted_ = false; }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -143,12 +142,20 @@ private:
     AudioService audio_service_;
     std::unique_ptr<Ota> ota_;
 
+
     bool has_server_time_ = false;
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    bool local_song_playing_ = false;
     bool youtube_song_requested_ = false;
     std::string youtube_song_query_;
+    bool wifi_reset_confirmation_pending_ = false;
+    int64_t wifi_reset_confirmation_deadline_us_ = 0;
+    int64_t wake_word_ignore_until_us_ = 0;
+    int64_t last_wake_word_accepted_us_ = 0;
+    int64_t listening_started_at_us_ = 0;
+    int64_t standby_until_us_ = 0;  // Hands-free blocked until this time
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -170,6 +177,17 @@ private:
     void CheckAssetsVersion();
     void CheckNewVersion();
     void InitializeProtocol();
+    void ArmWakeWordCooldown(int64_t duration_us);
+    bool IsListeningGracePeriodActive() const;
+    bool ShouldIgnoreWakeWord(const std::string& wake_word);
+    bool ClearStoredWifiCredentials();
+    bool TryHandleModeSwitchCommand(const std::string& text);
+    bool TryHandleWifiResetCommand(const std::string& text);
+    bool TryHandleLocalSongCommand(const std::string& text);
+    bool TryHandleStandbyCommand(const std::string& text);
+    bool StopLocalSongPlayback(bool show_notification);
+    bool PlayLocalSong(int song_index);
+    bool PlayOggFile(const std::string& path);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     
