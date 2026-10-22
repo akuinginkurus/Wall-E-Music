@@ -20,9 +20,15 @@ LvglDisplay::LvglDisplay() {
     esp_timer_create_args_t notification_timer_args = {
         .callback = [](void *arg) {
             LvglDisplay *display = static_cast<LvglDisplay*>(arg);
-            DisplayLockGuard lock(display);
-            lv_obj_add_flag(display->notification_label_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(display->status_label_, LV_OBJ_FLAG_HIDDEN);
+            Application::GetInstance().Schedule([display]() {
+                DisplayLockGuard lock(display);
+                if (display->notification_label_ != nullptr) {
+                    lv_obj_add_flag(display->notification_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+                if (display->status_label_ != nullptr) {
+                    lv_obj_remove_flag(display->status_label_, LV_OBJ_FLAG_HIDDEN);
+                }
+            });
         },
         .arg = this,
         .dispatch_method = ESP_TIMER_TASK,
@@ -138,44 +144,9 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
     }
 
     esp_pm_lock_acquire(pm_lock_);
-    // Update battery icon
-    int battery_level;
-    bool charging, discharging;
-    const char* icon = nullptr;
-    if (board.GetBatteryLevel(battery_level, charging, discharging)) {
-        if (charging) {
-            icon = FONT_AWESOME_BATTERY_BOLT;
-        } else {
-            const char* levels[] = {
-                FONT_AWESOME_BATTERY_EMPTY, // 0-19%
-                FONT_AWESOME_BATTERY_QUARTER,    // 20-39%
-                FONT_AWESOME_BATTERY_HALF,    // 40-59%
-                FONT_AWESOME_BATTERY_THREE_QUARTERS,    // 60-79%
-                FONT_AWESOME_BATTERY_FULL, // 80-99%
-                FONT_AWESOME_BATTERY_FULL, // 100%
-            };
-            icon = levels[battery_level / 20];
-        }
-        DisplayLockGuard lock(this);
-        if (battery_label_ != nullptr && battery_icon_ != icon) {
-            battery_icon_ = icon;
-            lv_label_set_text(battery_label_, battery_icon_);
-        }
 
-        if (low_battery_popup_ != nullptr) {
-            if (strcmp(icon, FONT_AWESOME_BATTERY_EMPTY) == 0 && discharging) {
-                if (lv_obj_has_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN)) { // Show if low battery popup is hidden
-                    lv_obj_remove_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
-                    app.PlaySound(Lang::Sounds::OGG_LOW_BATTERY);
-                }
-            } else {
-                // Hide the low battery popup when the battery is not empty
-                if (!lv_obj_has_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN)) { // Hide if low battery popup is shown
-                    lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
-                }
-            }
-        }
-    }
+    // Battery status removed — not needed for this build
+    const char* icon = nullptr;
 
     // Update network icon every 10 seconds
     static int seconds_counter = 0;
