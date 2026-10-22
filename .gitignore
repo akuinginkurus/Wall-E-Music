@@ -6,6 +6,7 @@ build/
 .devcontainer/
 sdkconfig.old
 sdkconfig
+sdkconfig.production
 dependencies.lock
 .env
 releases/
@@ -15,5 +16,10 @@ main/mmap_generate_emoji.h
 .cache
 *.pyc
 *.bin
+*-private.pem
+*-private.key
+production-secrets/
 mmap_generate_*.h
 .clangd
+.commandcode/
+*.log
