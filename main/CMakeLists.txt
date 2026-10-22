@@ -223,6 +223,7 @@ idf_component_register(SRCS ${SOURCES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     PRIV_REQUIRES json esp_psram spi_flash esp_app_format app_update efuse bt mbedtls 78__esp-opus
+                    ) 
 
 # Use the ESP-IDF-provided python path when available to avoid PATH issues.
 if(DEFINED PYTHON)
