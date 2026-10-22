@@ -15,6 +15,15 @@
 #include <string>
 #include <chrono>
 
+enum class FaceState {
+    Idle,
+    Listening,
+    Speaking,
+    Music
+};
+
+struct ChronchiScreen;
+
 class Theme {
 public:
     Theme(const std::string& name) : name_(name) {}
@@ -39,6 +48,11 @@ public:
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
+    virtual void SetFaceState(FaceState state) { (void)state; }
+    virtual void ShowModeMenu(int selected_mode);
+    virtual void HideModeMenu();
+    virtual void ShowModeSwitching(const char* mode_name);
+    virtual void SetChronchiScreen(const ChronchiScreen& screen);
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }
@@ -58,7 +72,7 @@ protected:
 class DisplayLockGuard {
 public:
     DisplayLockGuard(Display *display) : display_(display) {
-        if (!display_->Lock(30000)) {
+        if (!display_->Lock(5000)) {
             ESP_LOGE("Display", "Failed to lock display");
         }
     }

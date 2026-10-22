@@ -2,24 +2,100 @@
 #include "assets/lang_config.h"
 #include "lvgl_theme.h"
 #include "lvgl_font.h"
+#include "chronchi/chronchi_assets.h"
+#include "chronchi/chronchi_models.h"
 
 #include <string>
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 
 #include <esp_log.h>
 #include <esp_err.h>
 #include <esp_lvgl_port.h>
 #include <font_awesome.h>
+#include "boards/common/board.h"
+#include "youtube_audio_poller.h"
 
 #define TAG "OledDisplay"
 
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_awesome_30_1);
+LV_FONT_DECLARE(lv_font_montserrat_10);
+LV_FONT_DECLARE(lv_font_montserrat_12);
+LV_FONT_DECLARE(lv_font_montserrat_14);
+
+namespace {
+constexpr int kCompactLabelX = 2;
+constexpr int kCompactLabelWidth = 124;
+constexpr int kCompactRowHeight = 13;
+constexpr int kChronchiHeaderY = 0;
+constexpr int kChronchiHeaderHeight = 16;
+constexpr int kChronchiHeaderLeftX = 2;
+constexpr int kChronchiHeaderLeftWidth = 106;
+constexpr int kChronchiBleIconX = 108;
+constexpr int kChronchiBleIconWidth = 20;
+constexpr int kChronchiBodyX = 3;
+constexpr int kChronchiBodyWidth = 122;
+constexpr int kChronchiBodyRowHeight = 15;
+constexpr int kChronchiBodyRow1Y = 17;
+constexpr int kChronchiBodyRow2Y = 33;
+constexpr int kChronchiBodyRow3Y = 49;
+
+void ConfigureCompactLabel(lv_obj_t* label, int y, lv_label_long_mode_t long_mode) {
+    lv_obj_set_pos(label, kCompactLabelX, y);
+    lv_obj_set_size(label, kCompactLabelWidth, kCompactRowHeight);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    lv_label_set_long_mode(label, long_mode);
+}
+
+void ConfigureChronchiLabel(lv_obj_t* label, int x, int y, int width, int height,
+                            lv_text_align_t align, lv_label_long_mode_t long_mode) {
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_size(label, width, height);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(label, align, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_line_space(label, 0, 0);
+    lv_label_set_long_mode(label, long_mode);
+}
+
+void ConfigureChronchiBodyLabel(lv_obj_t* label, int y, int height,
+                                lv_text_align_t align, lv_label_long_mode_t long_mode,
+                                int x = kChronchiBodyX, int width = kChronchiBodyWidth) {
+    ConfigureChronchiLabel(label, x, y, width, height, align, long_mode);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+}
+
+void FormatChronchiAppHeader(const char* source_app, char* output, size_t output_size) {
+    if (output_size == 0) return;
+    std::snprintf(output, output_size, "%.14s", source_app ? source_app : "");
+}
+
+const char* OrderStatusLabel(ChronchiOrderStatus status) {
+    switch (status) {
+        case ChronchiOrderStatus::Confirmed: return "Pesanan dikonfirmasi";
+        case ChronchiOrderStatus::Packed: return "Pesanan dikemas";
+        case ChronchiOrderStatus::Shipped: return "Pesanan dikirim";
+        case ChronchiOrderStatus::InTransit: return "Dalam perjalanan";
+        case ChronchiOrderStatus::OutForDelivery: return "Sedang diantar";
+        case ChronchiOrderStatus::Delivered: return "Pesanan diterima";
+        case ChronchiOrderStatus::Cancelled: return "Pesanan dibatalkan";
+        case ChronchiOrderStatus::Unknown: return "Status pesanan";
+    }
+    return "Status pesanan";
+}
+
+}  // namespace
 
 OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
-    int width, int height, bool mirror_x, bool mirror_y)
-    : panel_io_(panel_io), panel_(panel) {
+    int width, int height, bool mirror_x, bool mirror_y, bool animated_mode, bool chronchi_mode)
+    : panel_io_(panel_io), panel_(panel), animated_mode_(animated_mode),
+      chronchi_mode_(chronchi_mode) {
     width_ = width;
     height_ = height;
 
@@ -38,7 +114,7 @@ OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handl
 
     ESP_LOGI(TAG, "Initialize LVGL");
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    port_cfg.task_priority = 1;
+    port_cfg.task_priority = 3;
     port_cfg.task_stack = 6144;
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;
@@ -81,9 +157,43 @@ OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handl
     } else {
         SetupUI_128x32();
     }
+
+    SetupModeOverlay();
+    if (chronchi_mode_ && height_ == 64) {
+        SetupChronchiOverlay();
+    }
+    if (height_ == 64) {
+        SetupMusicOverlay();
+    }
+
+    if (height_ == 64 || height_ == 32) {
+        face_timer_ = lv_timer_create([](lv_timer_t* t) {
+            auto* self = static_cast<OledDisplay*>(lv_timer_get_user_data(t));
+            self->UpdateFace();
+        }, 60, this);
+    }
 }
 
 OledDisplay::~OledDisplay() {
+    if (face_timer_ != nullptr) {
+        lv_timer_del(face_timer_);
+        face_timer_ = nullptr;
+    }
+
+    if (music_container_ != nullptr) {
+        lv_obj_del(music_container_);
+        music_container_ = nullptr;
+    }
+
+    if (mode_overlay_ != nullptr) {
+        lv_obj_del(mode_overlay_);
+        mode_overlay_ = nullptr;
+    }
+    if (chronchi_overlay_ != nullptr) {
+        lv_obj_del(chronchi_overlay_);
+        chronchi_overlay_ = nullptr;
+    }
+
     if (content_ != nullptr) {
         lv_obj_del(content_);
     }
@@ -123,6 +233,484 @@ OledDisplay::~OledDisplay() {
     lvgl_port_deinit();
 }
 
+void OledDisplay::SetupModeOverlay() {
+    DisplayLockGuard lock(this);
+    auto screen = lv_screen_active();
+    mode_overlay_ = lv_obj_create(screen);
+    lv_obj_set_size(mode_overlay_, width_, height_);
+    lv_obj_align(mode_overlay_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(mode_overlay_, 0, 0);
+    lv_obj_set_style_border_width(mode_overlay_, 0, 0);
+    lv_obj_set_style_pad_all(mode_overlay_, 0, 0);
+    lv_obj_set_style_bg_color(mode_overlay_, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(mode_overlay_, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(mode_overlay_, LV_SCROLLBAR_MODE_OFF);
+
+    auto* title = lv_label_create(mode_overlay_);
+    lv_label_set_text(title, "SELECT MODE");
+    ConfigureCompactLabel(title, 1, LV_LABEL_LONG_CLIP);
+
+    mode_selection_label_ = lv_label_create(mode_overlay_);
+    lv_obj_set_pos(mode_selection_label_, kCompactLabelX, 16);
+    lv_obj_set_size(mode_selection_label_, kCompactLabelWidth, 27);
+    lv_obj_set_style_text_font(mode_selection_label_, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(mode_selection_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(mode_selection_label_, lv_color_black(), 0);
+    lv_obj_set_style_text_line_space(mode_selection_label_, 0, 0);
+    lv_label_set_long_mode(mode_selection_label_, LV_LABEL_LONG_CLIP);
+
+    mode_help_label_ = lv_label_create(mode_overlay_);
+    ConfigureCompactLabel(mode_help_label_, 50, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(mode_help_label_, "CLICK:NEXT  HOLD:OK");
+    lv_obj_add_flag(mode_overlay_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void OledDisplay::SetupChronchiOverlay() {
+    DisplayLockGuard lock(this);
+    if (top_bar_ != nullptr) lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+    if (status_bar_ != nullptr) lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+    if (content_ != nullptr) lv_obj_add_flag(content_, LV_OBJ_FLAG_HIDDEN);
+
+    auto screen = lv_screen_active();
+    chronchi_overlay_ = lv_obj_create(screen);
+    lv_obj_set_size(chronchi_overlay_, width_, height_);
+    lv_obj_align(chronchi_overlay_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(chronchi_overlay_, 0, 0);
+    lv_obj_set_style_border_width(chronchi_overlay_, 0, 0);
+    lv_obj_set_style_pad_all(chronchi_overlay_, 0, 0);
+    lv_obj_set_style_bg_color(chronchi_overlay_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(chronchi_overlay_, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(chronchi_overlay_, LV_SCROLLBAR_MODE_OFF);
+
+    // BLE icon — right side of header
+    chronchi_ble_icon_ = lv_label_create(chronchi_overlay_);
+    lv_obj_set_pos(chronchi_ble_icon_, kChronchiBleIconX, kChronchiHeaderY);
+    lv_obj_set_size(chronchi_ble_icon_, kChronchiBleIconWidth, kChronchiHeaderHeight);
+    lv_obj_set_style_text_font(chronchi_ble_icon_, &BUILTIN_ICON_FONT, 0);
+    lv_obj_set_style_text_color(chronchi_ble_icon_, lv_color_white(), 0);
+    lv_obj_set_style_text_align(chronchi_ble_icon_, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_text(chronchi_ble_icon_, "");
+
+    // Header label — app name or idle time, wide (106px)
+    chronchi_header_left_ = lv_label_create(chronchi_overlay_);
+    ConfigureChronchiLabel(chronchi_header_left_, kChronchiHeaderLeftX, kChronchiHeaderY,
+                           kChronchiHeaderLeftWidth, kChronchiHeaderHeight,
+                           LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(chronchi_header_left_, &lv_font_montserrat_12, 0);
+
+    chronchi_primary_ = lv_label_create(chronchi_overlay_);
+    ConfigureChronchiBodyLabel(chronchi_primary_, kChronchiBodyRow1Y,
+                               kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                               LV_LABEL_LONG_SCROLL_CIRCULAR);
+    chronchi_secondary_ = lv_label_create(chronchi_overlay_);
+    ConfigureChronchiBodyLabel(chronchi_secondary_, kChronchiBodyRow2Y, 31,
+                               LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_WRAP);
+    chronchi_footer_ = lv_label_create(chronchi_overlay_);
+    ConfigureChronchiBodyLabel(chronchi_footer_, kChronchiBodyRow3Y,
+                               kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                               LV_LABEL_LONG_SCROLL_CIRCULAR);
+
+    chronchi_icon_canvas_ = lv_canvas_create(chronchi_overlay_);
+    lv_canvas_set_buffer(chronchi_icon_canvas_, chronchi_icon_buffer_, 32, 32,
+                         LV_COLOR_FORMAT_I1);
+    lv_canvas_set_palette(chronchi_icon_canvas_, 0,
+                          lv_color_to_32(lv_color_black(), LV_OPA_COVER));
+    lv_canvas_set_palette(chronchi_icon_canvas_, 1,
+                          lv_color_to_32(lv_color_white(), LV_OPA_COVER));
+    lv_canvas_fill_bg(chronchi_icon_canvas_, lv_color_black(), LV_OPA_COVER);
+    ResetChronchiLayout();
+}
+
+void OledDisplay::SetupMusicOverlay() {
+    DisplayLockGuard lock(this);
+    auto screen = lv_screen_active();
+    music_container_ = lv_obj_create(screen);
+    lv_obj_set_size(music_container_, width_, height_);
+    lv_obj_align(music_container_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_radius(music_container_, 0, 0);
+    lv_obj_set_style_border_width(music_container_, 0, 0);
+    lv_obj_set_style_pad_all(music_container_, 0, 0);
+    lv_obj_set_style_bg_color(music_container_, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(music_container_, LV_OPA_COVER, 0);
+    lv_obj_set_scrollbar_mode(music_container_, LV_SCROLLBAR_MODE_OFF);
+
+    // Top Header Label: "MEMUTAR LAGU" (Y = 1..13)
+    auto* header_label = lv_label_create(music_container_);
+    lv_obj_set_pos(header_label, 2, 1);
+    lv_obj_set_size(header_label, 124, 13);
+    lv_obj_set_style_text_font(header_label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_align(header_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(header_label, lv_color_black(), 0);
+    lv_label_set_text(header_label, "MEMUTAR LAGU");
+
+    // Top Divider Line (Y = 14)
+    auto* line_top = lv_obj_create(music_container_);
+    lv_obj_set_pos(line_top, 2, 14);
+    lv_obj_set_size(line_top, 124, 1);
+    lv_obj_set_style_bg_color(line_top, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(line_top, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(line_top, 0, 0);
+
+    // Decorative side music notes
+    music_note_left_ = lv_label_create(music_container_);
+    lv_label_set_text(music_note_left_, "\xE2\x99\xAA");  // UTF-8 musical note eighth ♪
+    lv_obj_set_style_text_font(music_note_left_, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(music_note_left_, lv_color_black(), 0);
+    lv_obj_set_pos(music_note_left_, 7, 24);
+
+    music_note_right_ = lv_label_create(music_container_);
+    lv_label_set_text(music_note_right_, "\xE2\x99\xAB");  // UTF-8 musical notes beamed ♫
+    lv_obj_set_style_text_font(music_note_right_, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(music_note_right_, lv_color_black(), 0);
+    lv_obj_set_pos(music_note_right_, 113, 24);
+
+    // 9 Equalizer Bars in the center
+    // Centered from X=25, gap=3, width=6 -> total width 78px
+    // Baseline at Y=46, heights between 4 and 28
+    for (int i = 0; i < kMusicEqBarCount; i++) {
+        music_eq_bars_[i] = lv_obj_create(music_container_);
+        lv_obj_set_size(music_eq_bars_[i], 6, 6);
+        lv_obj_set_pos(music_eq_bars_[i], 25 + i * 9, 40);
+        lv_obj_set_style_bg_color(music_eq_bars_[i], lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(music_eq_bars_[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(music_eq_bars_[i], 0, 0);
+        lv_obj_set_style_radius(music_eq_bars_[i], 1, 0);
+        music_eq_heights_[i] = 6;
+        music_eq_targets_[i] = 10;
+    }
+
+    // Bottom Divider Line (Y = 48)
+    auto* line_bottom = lv_obj_create(music_container_);
+    lv_obj_set_pos(line_bottom, 2, 48);
+    lv_obj_set_size(line_bottom, 124, 1);
+    lv_obj_set_style_bg_color(line_bottom, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(line_bottom, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(line_bottom, 0, 0);
+
+    // Scrolling Song Title Label (Y = 50)
+    music_title_label_ = lv_label_create(music_container_);
+    lv_obj_set_pos(music_title_label_, 2, 50);
+    lv_obj_set_size(music_title_label_, 124, 13);
+    lv_obj_set_style_text_font(music_title_label_, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(music_title_label_, lv_color_black(), 0);
+    lv_obj_set_style_text_align(music_title_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(music_title_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(music_title_label_, "YouTube Music");
+
+    static lv_anim_t title_anim;
+    lv_anim_init(&title_anim);
+    lv_anim_set_delay(&title_anim, 800);
+    lv_anim_set_repeat_count(&title_anim, LV_ANIM_REPEAT_INFINITE);
+    lv_obj_set_style_anim(music_title_label_, &title_anim, LV_PART_MAIN);
+    lv_obj_set_style_anim_duration(music_title_label_, lv_anim_speed_clamped(50, 300, 60000), LV_PART_MAIN);
+
+    // Hidden by default until FaceState::Music is entered
+    lv_obj_add_flag(music_container_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void OledDisplay::ShowModeMenu(int selected_mode) {
+    DisplayLockGuard lock(this);
+    if (mode_overlay_ == nullptr) return;
+    // 0=Xiaozhi, 1=Chronchi
+    static const char* menus[] = {
+        "> XIAOZHI\n  CHRONCHI",
+        "  XIAOZHI\n> CHRONCHI",
+    };
+    int idx = (selected_mode >= 0 && selected_mode <= 1) ? selected_mode : 0;
+    lv_label_set_text(mode_selection_label_, menus[idx]);
+    lv_label_set_text(mode_help_label_, "CLICK:NEXT  HOLD:OK");
+    lv_obj_remove_flag(mode_overlay_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(mode_overlay_);
+}
+
+void OledDisplay::HideModeMenu() {
+    DisplayLockGuard lock(this);
+    if (mode_overlay_ != nullptr) lv_obj_add_flag(mode_overlay_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void OledDisplay::ShowModeSwitching(const char* mode_name) {
+    DisplayLockGuard lock(this);
+    if (mode_overlay_ == nullptr) return;
+    char text[48];
+    snprintf(text, sizeof(text), "SWITCHING TO\n%s", mode_name);
+    lv_label_set_text(mode_selection_label_, text);
+    lv_label_set_text(mode_help_label_, "RESTARTING...");
+    lv_obj_remove_flag(mode_overlay_, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(mode_overlay_);
+}
+
+void OledDisplay::ResetChronchiLayout() {
+    lv_obj_t* objects[] = {chronchi_ble_icon_,
+                           chronchi_header_left_,
+                           chronchi_primary_, chronchi_secondary_, chronchi_footer_,
+                           chronchi_icon_canvas_};
+    for (lv_obj_t* object : objects) {
+        if (object != nullptr) lv_obj_add_flag(object, LV_OBJ_FLAG_HIDDEN);
+    }
+    // Restore default header layout
+    ConfigureChronchiLabel(chronchi_header_left_, kChronchiHeaderLeftX, kChronchiHeaderY,
+                           kChronchiHeaderLeftWidth, kChronchiHeaderHeight,
+                           LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(chronchi_header_left_, &lv_font_montserrat_12, 0);
+    ConfigureChronchiBodyLabel(chronchi_primary_, kChronchiBodyRow1Y,
+                               kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                               LV_LABEL_LONG_SCROLL_CIRCULAR);
+    ConfigureChronchiBodyLabel(chronchi_secondary_, kChronchiBodyRow2Y, 31,
+                               LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_WRAP);
+    ConfigureChronchiBodyLabel(chronchi_footer_, kChronchiBodyRow3Y,
+                               kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                               LV_LABEL_LONG_SCROLL_CIRCULAR);
+    if (chronchi_ble_icon_ != nullptr) lv_label_set_text(chronchi_ble_icon_, "");
+    lv_label_set_text(chronchi_header_left_, "");
+    lv_label_set_text(chronchi_primary_, "");
+    lv_label_set_text(chronchi_secondary_, "");
+    lv_label_set_text(chronchi_footer_, "");
+}
+
+void OledDisplay::DrawChronchiBitmap(const uint8_t* bitmap, int bitmap_width,
+                                     int bitmap_height) {
+    if (chronchi_icon_canvas_ == nullptr || bitmap == nullptr ||
+        bitmap_width <= 0 || bitmap_height <= 0 || bitmap_width > 32 || bitmap_height > 32) {
+        return;
+    }
+    lv_canvas_fill_bg(chronchi_icon_canvas_, lv_color_black(), LV_OPA_COVER);
+    const int offset_x = (32 - bitmap_width) / 2;
+    const int offset_y = (32 - bitmap_height) / 2;
+    const int stride = (bitmap_width + 7) / 8;
+    for (int y = 0; y < bitmap_height; ++y) {
+        for (int x = 0; x < bitmap_width; ++x) {
+            if ((bitmap[y * stride + x / 8] & (0x80 >> (x & 7))) != 0) {
+                lv_canvas_set_px(chronchi_icon_canvas_, offset_x + x, offset_y + y,
+                                 lv_color_white(), LV_OPA_COVER);
+            }
+        }
+    }
+    lv_obj_remove_flag(chronchi_icon_canvas_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void OledDisplay::SetChronchiScreen(const ChronchiScreen& screen) {
+    DisplayLockGuard lock(this);
+    if (chronchi_overlay_ == nullptr) return;
+    ResetChronchiLayout();
+
+    auto show = [](lv_obj_t* object) { lv_obj_remove_flag(object, LV_OBJ_FLAG_HIDDEN); };
+    auto set_header = [&](const char* text) {
+        lv_label_set_text(chronchi_header_left_, text ? text : "");
+        show(chronchi_header_left_);
+    };
+
+    char app_header[15] = {};
+    FormatChronchiAppHeader(screen.source_app, app_header, sizeof(app_header));
+
+    if (chronchi_ble_icon_ != nullptr) {
+        const char* ble_icon = (screen.connection == ChronchiConnectionState::Connected)
+                                   ? FONT_AWESOME_BLUETOOTH
+                                   : "";
+        lv_label_set_text(chronchi_ble_icon_, ble_icon);
+        if (ble_icon[0] != '\0') {
+            show(chronchi_ble_icon_);
+        }
+    }
+
+    switch (screen.type) {
+        case ChronchiScreenType::Home: {
+            char header_text[24] = {};
+            if (screen.date[0] != '\0' && std::strcmp(screen.date, "Menunggu sinkronisasi") != 0) {
+                std::snprintf(header_text, sizeof(header_text), "%.14s", screen.date);
+            } else {
+                std::snprintf(header_text, sizeof(header_text), "CHRONOS");
+            }
+            set_header(header_text);
+
+            // Centered prominent clock in Row 1
+            ConfigureChronchiBodyLabel(chronchi_primary_, 16, 18,
+                                       LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_CLIP);
+            lv_obj_set_style_text_font(chronchi_primary_, &lv_font_montserrat_14, 0);
+            lv_label_set_text(chronchi_primary_, (screen.time[0] != '\0') ? screen.time : "--:--");
+
+            // Weather in Row 2
+            ConfigureChronchiBodyLabel(chronchi_secondary_, 35, 13,
+                                       LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_set_style_text_font(chronchi_secondary_, &lv_font_montserrat_10, 0);
+            if (screen.weather[0] != '\0' && std::strcmp(screen.weather, "-- C") != 0) {
+                lv_label_set_text(chronchi_secondary_, screen.weather);
+                show(chronchi_secondary_);
+            } else {
+                lv_label_set_text(chronchi_secondary_, "");
+            }
+
+            // Location / Phone battery / connection status in Row 3 / Footer
+            ConfigureChronchiBodyLabel(chronchi_footer_, 49, 14,
+                                       LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_set_style_text_font(chronchi_footer_, &lv_font_montserrat_10, 0);
+            if (screen.location[0] != '\0' && std::strcmp(screen.location, "Android belum terhubung") != 0) {
+                if (screen.battery_valid) {
+                    char loc_bat[48] = {};
+                    std::snprintf(loc_bat, sizeof(loc_bat), "%s  HP:%u%%%s", screen.location,
+                                  screen.battery, screen.charging ? "+" : "");
+                    lv_label_set_text(chronchi_footer_, loc_bat);
+                } else {
+                    lv_label_set_text(chronchi_footer_, screen.location);
+                }
+            } else {
+                if (screen.connection == ChronchiConnectionState::Connected) {
+                    if (screen.battery_valid) {
+                        char bat_status[32] = {};
+                        std::snprintf(bat_status, sizeof(bat_status), "Chronos OK  HP:%u%%%s",
+                                      screen.battery, screen.charging ? "+" : "");
+                        lv_label_set_text(chronchi_footer_, bat_status);
+                    } else {
+                        lv_label_set_text(chronchi_footer_, "Chronos Terhubung");
+                    }
+                } else {
+                    lv_label_set_text(chronchi_footer_, "Buka App Chronos");
+                }
+            }
+            show(chronchi_primary_);
+            show(chronchi_footer_);
+            break;
+        }
+
+        case ChronchiScreenType::Message:
+            set_header(app_header);
+            // Row 1: Sender / Title (Y=16, height=14)
+            ConfigureChronchiBodyLabel(chronchi_primary_, 16, 14,
+                                       LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_obj_set_style_text_font(chronchi_primary_, &lv_font_montserrat_10, 0);
+            lv_label_set_text(chronchi_primary_, screen.primary);
+
+            // Row 2-3: Message body (Y=31, height=32) with word wrap
+            ConfigureChronchiBodyLabel(chronchi_secondary_, 31, 32,
+                                       LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_font(chronchi_secondary_, &lv_font_montserrat_10, 0);
+            lv_label_set_text(chronchi_secondary_, screen.secondary);
+
+            show(chronchi_primary_);
+            show(chronchi_secondary_);
+            break;
+
+        case ChronchiScreenType::Professional:
+        case ChronchiScreenType::Payment:
+            set_header(app_header);
+            lv_label_set_text(chronchi_primary_, screen.primary);
+            lv_label_set_text(chronchi_secondary_, screen.secondary);
+            ConfigureChronchiBodyLabel(chronchi_primary_, kChronchiBodyRow1Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR);
+            ConfigureChronchiBodyLabel(chronchi_secondary_, kChronchiBodyRow2Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR);
+            show(chronchi_primary_);
+            show(chronchi_secondary_);
+            break;
+
+        case ChronchiScreenType::Order: {
+            set_header(app_header);
+            const uint8_t* bitmap = ChronchiAssets::kPackage32x32;
+            if (screen.order_status == ChronchiOrderStatus::OutForDelivery) {
+                bitmap = ChronchiAssets::kDelivery32x32;
+            } else if (screen.order_status == ChronchiOrderStatus::Cancelled) {
+                bitmap = ChronchiAssets::kCancelled32x32;
+            }
+            lv_obj_set_pos(chronchi_icon_canvas_, 44, 17);
+            DrawChronchiBitmap(bitmap, 32, 32);
+            lv_label_set_text(chronchi_footer_,
+                              screen.primary[0] ? screen.primary : OrderStatusLabel(screen.order_status));
+            show(chronchi_footer_);
+            break;
+        }
+
+        case ChronchiScreenType::Navigation: {
+            set_header("NAVIGASI");
+            lv_obj_set_pos(chronchi_icon_canvas_, 1, 17);
+            if (screen.has_custom_icon) {
+                DrawChronchiBitmap(screen.custom_icon, 32, 32);
+            } else {
+                const uint8_t* bitmap = ChronchiAssets::kStraight32x32;
+                switch (screen.maneuver) {
+                    case ChronchiManeuver::Left:
+                        bitmap = ChronchiAssets::kLeft32x32; break;
+                    case ChronchiManeuver::Right:
+                        bitmap = ChronchiAssets::kRight32x32; break;
+                    case ChronchiManeuver::SlightLeft:
+                        bitmap = ChronchiAssets::kSlightLeft32x32; break;
+                    case ChronchiManeuver::SlightRight:
+                        bitmap = ChronchiAssets::kSlightRight32x32; break;
+                    case ChronchiManeuver::Roundabout:
+                        bitmap = ChronchiAssets::kRoundabout32x32; break;
+                    case ChronchiManeuver::Arrive:
+                        bitmap = ChronchiAssets::kArrive32x32; break;
+                    case ChronchiManeuver::Straight:
+                    case ChronchiManeuver::Unknown:
+                        bitmap = ChronchiAssets::kStraight32x32; break;
+                }
+                DrawChronchiBitmap(bitmap, 32, 32);
+            }
+            ConfigureChronchiBodyLabel(chronchi_primary_, kChronchiBodyRow1Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_LEFT,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR, 43, 83);
+            ConfigureChronchiBodyLabel(chronchi_secondary_, kChronchiBodyRow2Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_LEFT,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR, 43, 83);
+            ConfigureChronchiBodyLabel(chronchi_footer_, kChronchiBodyRow3Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_LEFT,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR, 43, 83);
+            lv_label_set_text(chronchi_primary_, screen.primary);
+            lv_label_set_text(chronchi_secondary_, screen.secondary);
+            lv_label_set_text(chronchi_footer_, screen.footer);
+            show(chronchi_primary_);
+            show(chronchi_secondary_);
+            show(chronchi_footer_);
+            break;
+        }
+
+        case ChronchiScreenType::Startup:
+        case ChronchiScreenType::Connection:
+            ConfigureChronchiLabel(chronchi_header_left_, 0, 0,
+                                    width_, 16,
+                                    LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_CLIP);
+            lv_obj_set_style_text_font(chronchi_header_left_, &lv_font_montserrat_14, 0);
+            lv_label_set_text(chronchi_header_left_, screen.source_app);
+            ConfigureChronchiBodyLabel(chronchi_primary_, kChronchiBodyRow1Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR);
+            ConfigureChronchiBodyLabel(chronchi_secondary_, kChronchiBodyRow2Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_label_set_text(chronchi_primary_, screen.primary);
+            lv_label_set_text(chronchi_secondary_, screen.secondary);
+            show(chronchi_header_left_);
+            show(chronchi_primary_);
+            show(chronchi_secondary_);
+            break;
+
+        case ChronchiScreenType::System:
+            ConfigureChronchiLabel(chronchi_header_left_, kChronchiHeaderLeftX, 0,
+                                    kChronchiHeaderLeftWidth,
+                                    16,
+                                    LV_TEXT_ALIGN_LEFT, LV_LABEL_LONG_CLIP);
+            lv_obj_set_style_text_font(chronchi_header_left_, &lv_font_montserrat_12, 0);
+            lv_label_set_text(chronchi_header_left_, screen.source_app);
+            ConfigureChronchiBodyLabel(chronchi_primary_, kChronchiBodyRow1Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR);
+            ConfigureChronchiBodyLabel(chronchi_secondary_, kChronchiBodyRow2Y,
+                                       kChronchiBodyRowHeight, LV_TEXT_ALIGN_CENTER,
+                                       LV_LABEL_LONG_SCROLL_CIRCULAR);
+            lv_label_set_text(chronchi_primary_, screen.primary);
+            lv_label_set_text(chronchi_secondary_, screen.secondary);
+            show(chronchi_header_left_);
+            show(chronchi_primary_);
+            show(chronchi_secondary_);
+            break;
+    }
+
+    lv_obj_move_foreground(chronchi_overlay_);
+    if (mode_overlay_ != nullptr && !lv_obj_has_flag(mode_overlay_, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_move_foreground(mode_overlay_);
+    }
+}
+
 bool OledDisplay::Lock(int timeout_ms) {
     return lvgl_port_lock(timeout_ms);
 }
@@ -132,7 +720,19 @@ void OledDisplay::Unlock() {
 }
 
 void OledDisplay::SetChatMessage(const char* role, const char* content) {
+    (void)role;
     DisplayLockGuard lock(this);
+
+    if (music_title_label_ != nullptr && content != nullptr && content[0] != '\0') {
+        const char* title_text = content;
+        if (strncmp(title_text, "[PLAY] ", 7) == 0) {
+            title_text += 7;
+        }
+        std::string title_str = title_text;
+        std::replace(title_str.begin(), title_str.end(), '\n', ' ');
+        lv_label_set_text(music_title_label_, title_str.c_str());
+    }
+
     if (chat_message_label_ == nullptr) {
         return;
     }
@@ -236,41 +836,103 @@ void OledDisplay::SetupUI_128x64() {
     lv_obj_set_style_pad_all(content_, 0, 0);
     lv_obj_set_width(content_, LV_HOR_RES);
     lv_obj_set_flex_grow(content_, 1);
-    lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_flex_main_place(content_, LV_FLEX_ALIGN_CENTER, 0);
 
-    content_left_ = lv_obj_create(content_);
-    lv_obj_set_size(content_left_, 32, LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_all(content_left_, 0, 0);
-    lv_obj_set_style_border_width(content_left_, 0, 0);
+    if (animated_mode_) {
+        lv_obj_set_size(content_, 128, 48);
+        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(content_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    emotion_label_ = lv_label_create(content_left_);
-    lv_obj_set_style_text_font(emotion_label_, large_icon_font, 0);
-    lv_label_set_text(emotion_label_, FONT_AWESOME_MICROCHIP_AI);
-    lv_obj_center(emotion_label_);
-    lv_obj_set_style_pad_top(emotion_label_, 8, 0);
+        face_container_ = lv_obj_create(content_);
+        lv_obj_set_size(face_container_, 128, 48);
+        lv_obj_set_style_border_width(face_container_, 0, 0);
+        lv_obj_set_style_bg_opa(face_container_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_pad_all(face_container_, 0, 0);
 
-    content_right_ = lv_obj_create(content_);
-    lv_obj_set_size(content_right_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_all(content_right_, 0, 0);
-    lv_obj_set_style_border_width(content_right_, 0, 0);
-    lv_obj_set_flex_grow(content_right_, 1);
-    lv_obj_add_flag(content_right_, LV_OBJ_FLAG_HIDDEN);
+        left_eye_ = lv_obj_create(face_container_);
+        right_eye_ = lv_obj_create(face_container_);
+        mouth_ = lv_obj_create(face_container_);
 
-    chat_message_label_ = lv_label_create(content_right_);
-    lv_label_set_text(chat_message_label_, "");
-    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_width(chat_message_label_, width_ - 32);
-    lv_obj_set_style_pad_top(chat_message_label_, 14, 0);
+        lv_obj_set_style_bg_color(left_eye_, lv_color_black(), 0);
+        lv_obj_set_style_bg_color(right_eye_, lv_color_black(), 0);
+        lv_obj_set_style_bg_color(mouth_, lv_color_black(), 0);
 
-    // Start scrolling subtitle after a delay
-    static lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_delay(&a, 1000);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_obj_set_style_anim(chat_message_label_, &a, LV_PART_MAIN);
-    lv_obj_set_style_anim_duration(chat_message_label_, lv_anim_speed_clamped(60, 300, 60000), LV_PART_MAIN);
+        lv_obj_set_style_border_width(left_eye_, 0, 0);
+        lv_obj_set_style_border_width(right_eye_, 0, 0);
+        lv_obj_set_style_border_width(mouth_, 0, 0);
+
+        lv_obj_set_style_radius(left_eye_, 2, 0);
+        lv_obj_set_style_radius(right_eye_, 2, 0);
+        lv_obj_set_style_radius(mouth_, 4, 0);
+
+        IdleBehavior(kEyeSize);
+
+        for (int i = 0; i < kEqBarCount; i++) {
+            eq_bars_[i] = lv_obj_create(face_container_);
+            lv_obj_set_size(eq_bars_[i], 4, 6);
+            lv_obj_set_style_bg_color(eq_bars_[i], lv_color_black(), 0);
+            lv_obj_set_style_border_width(eq_bars_[i], 0, 0);
+            lv_obj_set_style_radius(eq_bars_[i], 1, 0);
+            lv_obj_align(eq_bars_[i], LV_ALIGN_CENTER, -12 + i * 6, 16);
+            lv_obj_add_flag(eq_bars_[i], LV_OBJ_FLAG_HIDDEN);
+            eq_heights_[i] = 6;
+            eq_targets_[i] = 10;
+        }
+    } else {
+        lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_flex_main_place(content_, LV_FLEX_ALIGN_CENTER, 0);
+
+        content_left_ = lv_obj_create(content_);
+        lv_obj_set_size(content_left_, 32, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(content_left_, 0, 0);
+        lv_obj_set_style_border_width(content_left_, 0, 0);
+
+        emotion_label_ = lv_label_create(content_left_);
+        lv_obj_set_style_text_font(emotion_label_, large_icon_font, 0);
+        lv_label_set_text(emotion_label_, FONT_AWESOME_MICROCHIP_AI);
+        lv_obj_center(emotion_label_);
+        lv_obj_set_style_pad_top(emotion_label_, 8, 0);
+
+        classic_eq_container_ = lv_obj_create(content_left_);
+        lv_obj_set_size(classic_eq_container_, 26, 26);
+        lv_obj_set_style_bg_opa(classic_eq_container_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(classic_eq_container_, 0, 0);
+        lv_obj_set_style_pad_all(classic_eq_container_, 0, 0);
+        lv_obj_align(classic_eq_container_, LV_ALIGN_CENTER, 0, 4);
+        lv_obj_add_flag(classic_eq_container_, LV_OBJ_FLAG_HIDDEN);
+
+        for (int i = 0; i < kClassicEqBarCount; i++) {
+            classic_eq_bars_[i] = lv_obj_create(classic_eq_container_);
+            lv_obj_set_size(classic_eq_bars_[i], 4, 6);
+            lv_obj_set_style_bg_color(classic_eq_bars_[i], lv_color_black(), 0);
+            lv_obj_set_style_border_width(classic_eq_bars_[i], 0, 0);
+            lv_obj_set_style_radius(classic_eq_bars_[i], 1, 0);
+            lv_obj_align(classic_eq_bars_[i], LV_ALIGN_BOTTOM_LEFT, i * 6 + 1, 0);
+            classic_eq_heights_[i] = 6;
+            classic_eq_targets_[i] = 12;
+        }
+
+        content_right_ = lv_obj_create(content_);
+        lv_obj_set_size(content_right_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(content_right_, 0, 0);
+        lv_obj_set_style_border_width(content_right_, 0, 0);
+        lv_obj_set_flex_grow(content_right_, 1);
+        lv_obj_add_flag(content_right_, LV_OBJ_FLAG_HIDDEN);
+
+        chat_message_label_ = lv_label_create(content_right_);
+        lv_label_set_text(chat_message_label_, "");
+        lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_set_width(chat_message_label_, width_ - 32);
+        lv_obj_set_style_pad_top(chat_message_label_, 14, 0);
+
+        // Start scrolling subtitle after a delay
+        static lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_delay(&a, 1000);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_obj_set_style_anim(chat_message_label_, &a, LV_PART_MAIN);
+        lv_obj_set_style_anim_duration(chat_message_label_, lv_anim_speed_clamped(60, 300, 60000), LV_PART_MAIN);
+    }
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -315,6 +977,25 @@ void OledDisplay::SetupUI_128x32() {
     lv_obj_set_style_text_font(emotion_label_, large_icon_font, 0);
     lv_label_set_text(emotion_label_, FONT_AWESOME_MICROCHIP_AI);
     lv_obj_center(emotion_label_);
+
+    classic_eq_container_ = lv_obj_create(content_);
+    lv_obj_set_size(classic_eq_container_, 26, 26);
+    lv_obj_set_style_bg_opa(classic_eq_container_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(classic_eq_container_, 0, 0);
+    lv_obj_set_style_pad_all(classic_eq_container_, 0, 0);
+    lv_obj_align(classic_eq_container_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(classic_eq_container_, LV_OBJ_FLAG_HIDDEN);
+
+    for (int i = 0; i < kClassicEqBarCount; i++) {
+        classic_eq_bars_[i] = lv_obj_create(classic_eq_container_);
+        lv_obj_set_size(classic_eq_bars_[i], 4, 6);
+        lv_obj_set_style_bg_color(classic_eq_bars_[i], lv_color_black(), 0);
+        lv_obj_set_style_border_width(classic_eq_bars_[i], 0, 0);
+        lv_obj_set_style_radius(classic_eq_bars_[i], 1, 0);
+        lv_obj_align(classic_eq_bars_[i], LV_ALIGN_BOTTOM_LEFT, i * 6 + 1, 0);
+        classic_eq_heights_[i] = 6;
+        classic_eq_targets_[i] = 12;
+    }
 
     /* Right side */
     side_bar_ = lv_obj_create(container_);
@@ -373,6 +1054,10 @@ void OledDisplay::SetupUI_128x32() {
 }
 
 void OledDisplay::SetEmotion(const char* emotion) {
+    if (animated_mode_) {
+        return;
+    }
+
     const char* utf8 = font_awesome_get_utf8(emotion);
     DisplayLockGuard lock(this);
     if (emotion_label_ == nullptr) {
@@ -393,4 +1078,349 @@ void OledDisplay::SetTheme(Theme* theme) {
 
     auto screen = lv_screen_active();
     lv_obj_set_style_text_font(screen, text_font, 0);
+}
+
+void OledDisplay::SetFaceState(FaceState state) {
+    FaceState prev = face_state_;
+    face_state_ = state;
+
+    DisplayLockGuard lock(this);
+    if (state == FaceState::Music) {
+        if (music_title_label_ != nullptr) {
+            std::string cur_title = YouTubeAudioPoller::GetInstance().GetCurrentTitle();
+            if (!cur_title.empty()) {
+                lv_label_set_text(music_title_label_, cur_title.c_str());
+            }
+        }
+        if (music_container_ != nullptr) {
+            lv_obj_remove_flag(music_container_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(music_container_);
+        }
+    } else if (prev == FaceState::Music && state != FaceState::Music) {
+        if (music_container_ != nullptr) {
+            lv_obj_add_flag(music_container_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (classic_eq_container_ != nullptr) {
+            lv_obj_add_flag(classic_eq_container_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emotion_label_ != nullptr) {
+            lv_obj_remove_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        for (int i = 0; i < kEqBarCount; i++) {
+            if (eq_bars_[i] != nullptr) {
+                lv_obj_add_flag(eq_bars_[i], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (mouth_ != nullptr) {
+            lv_obj_remove_flag(mouth_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void OledDisplay::IdleBehavior(int base_eye_height) {
+    if (left_eye_ == nullptr || right_eye_ == nullptr || mouth_ == nullptr) {
+        return;
+    }
+
+    lv_obj_remove_flag(mouth_, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < kEqBarCount; i++) {
+        if (eq_bars_[i] != nullptr) {
+            lv_obj_add_flag(eq_bars_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (std::rand() % 40 == 0) {
+        idle_move_offset_x_ = (std::rand() % 5) - 2;
+        idle_move_offset_y_ = (std::rand() % 3) - 1;
+    }
+
+    int eye_h = base_eye_height;
+    int eye_w = static_cast<int>(eye_h * 0.65f);
+
+    lv_obj_set_size(left_eye_, eye_w, eye_h);
+    lv_obj_set_size(right_eye_, eye_w, eye_h);
+
+    lv_obj_align(left_eye_, LV_ALIGN_CENTER, -12 + idle_move_offset_x_, -5 + idle_move_offset_y_);
+    lv_obj_align(right_eye_, LV_ALIGN_CENTER, 12 + idle_move_offset_x_, -5 + idle_move_offset_y_);
+
+    lv_obj_set_size(mouth_, 14, 3);
+    lv_obj_align(mouth_, LV_ALIGN_CENTER, idle_move_offset_x_, 10 + idle_move_offset_y_);
+}
+
+void OledDisplay::ListeningBehavior(int base_eye_height) {
+    if (left_eye_ == nullptr || right_eye_ == nullptr || mouth_ == nullptr) {
+        return;
+    }
+
+    lv_obj_remove_flag(mouth_, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < kEqBarCount; i++) {
+        if (eq_bars_[i] != nullptr) {
+            lv_obj_add_flag(eq_bars_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    int right_h = base_eye_height;
+    int right_w = static_cast<int>(right_h * 0.65f);
+    int left_h = base_eye_height - 2;
+    int left_w = static_cast<int>(left_h * 0.65f);
+
+    lv_obj_set_size(left_eye_, left_w, left_h);
+    lv_obj_set_size(right_eye_, right_w, right_h);
+
+    lv_obj_align(left_eye_, LV_ALIGN_CENTER, -16, -5);
+    lv_obj_align(right_eye_, LV_ALIGN_CENTER, 4, -5);
+
+    lv_obj_set_size(mouth_, 10, 2);
+    lv_obj_align(mouth_, LV_ALIGN_CENTER, -4, 10);
+}
+
+void OledDisplay::SpeakingBehavior(int eye_height) {
+    if (left_eye_ == nullptr || right_eye_ == nullptr || mouth_ == nullptr) {
+        return;
+    }
+
+    lv_obj_remove_flag(mouth_, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < kEqBarCount; i++) {
+        if (eq_bars_[i] != nullptr) {
+            lv_obj_add_flag(eq_bars_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    uint32_t now = lv_tick_get();
+
+    lv_obj_set_size(left_eye_, static_cast<int>(eye_height * 0.65f), eye_height);
+    lv_obj_set_size(right_eye_, static_cast<int>(eye_height * 0.65f), eye_height);
+    lv_obj_align(left_eye_, LV_ALIGN_CENTER, -30, -6);
+    lv_obj_align(right_eye_, LV_ALIGN_CENTER, 30, -6);
+
+    if (now - speak_last_update_ > static_cast<uint32_t>(90 + (std::rand() % 60))) {
+        speak_last_update_ = now;
+        int r = std::rand() % 100;
+        if (r < 20) {
+            speak_mouth_target_ = 2;
+        } else if (r < 50) {
+            speak_mouth_target_ = 6;
+        } else if (r < 80) {
+            speak_mouth_target_ = 10;
+        } else {
+            speak_mouth_target_ = 16;
+        }
+    }
+
+    if (speak_mouth_current_ < speak_mouth_target_) {
+        speak_mouth_current_ += 2;
+    } else if (speak_mouth_current_ > speak_mouth_target_) {
+        speak_mouth_current_ -= 2;
+    }
+
+    lv_obj_set_size(mouth_, 15, speak_mouth_current_);
+    lv_obj_set_style_radius(mouth_, 8, 0);
+    lv_obj_align(mouth_, LV_ALIGN_CENTER, 0, 18);
+}
+
+void OledDisplay::MusicBehavior() {
+    if (left_eye_ == nullptr || right_eye_ == nullptr || mouth_ == nullptr) {
+        return;
+    }
+
+    lv_obj_add_flag(mouth_, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < kEqBarCount; i++) {
+        if (eq_bars_[i] != nullptr) {
+            lv_obj_remove_flag(eq_bars_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    uint32_t now = lv_tick_get();
+    if (now - music_anim_last_update_ > 110) {
+        music_anim_last_update_ = now;
+        music_groove_phase_ = (music_groove_phase_ + 1) % 8;
+
+        for (int i = 0; i < kEqBarCount; i++) {
+            int max_h = (i == 2) ? 18 : ((i == 1 || i == 3) ? 15 : 12);
+            eq_targets_[i] = 4 + (std::rand() % (max_h - 3));
+        }
+    }
+
+    for (int i = 0; i < kEqBarCount; i++) {
+        if (eq_bars_[i] == nullptr) continue;
+        if (eq_heights_[i] < eq_targets_[i]) {
+            eq_heights_[i] = std::min(eq_heights_[i] + 3, eq_targets_[i]);
+        } else if (eq_heights_[i] > eq_targets_[i]) {
+            eq_heights_[i] = std::max(eq_heights_[i] - 2, eq_targets_[i]);
+        }
+        int h = std::max(3, eq_heights_[i]);
+        lv_obj_set_size(eq_bars_[i], 4, h);
+        lv_obj_align(eq_bars_[i], LV_ALIGN_CENTER, -12 + i * 6, 17 - (h / 2));
+    }
+
+    int bob_x = 0;
+    int bob_y = 0;
+    int eye_h = kEyeSize;
+    int eye_w = static_cast<int>(eye_h * 0.65f);
+
+    switch (music_groove_phase_) {
+        case 0: bob_x = -3; bob_y = 1; eye_h = kEyeSize - 1; break;
+        case 1: bob_x = -2; bob_y = -2; eye_h = kEyeSize; break;
+        case 2: bob_x = 0; bob_y = -3; eye_h = kEyeSize + 2; break;
+        case 3: bob_x = 2; bob_y = -1; eye_h = kEyeSize; break;
+        case 4: bob_x = 3; bob_y = 1; eye_h = kEyeSize - 1; break;
+        case 5: bob_x = 2; bob_y = -2; eye_h = kEyeSize; break;
+        case 6: bob_x = 0; bob_y = -3; eye_h = kEyeSize + 2; break;
+        case 7: bob_x = -2; bob_y = -1; eye_h = kEyeSize; break;
+    }
+
+    lv_obj_set_size(left_eye_, eye_w, eye_h);
+    lv_obj_set_size(right_eye_, eye_w, eye_h);
+
+    lv_obj_align(left_eye_, LV_ALIGN_CENTER, -28 + bob_x, -7 + bob_y);
+    lv_obj_align(right_eye_, LV_ALIGN_CENTER, 28 + bob_x, -7 + bob_y);
+}
+
+void OledDisplay::UpdateClassicMusicAnimation() {
+    if (classic_eq_container_ == nullptr) {
+        return;
+    }
+
+    if (emotion_label_ != nullptr) {
+        lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_remove_flag(classic_eq_container_, LV_OBJ_FLAG_HIDDEN);
+
+    uint32_t now = lv_tick_get();
+    if (now - music_anim_last_update_ > 90) {
+        music_anim_last_update_ = now;
+        for (int i = 0; i < kClassicEqBarCount; i++) {
+            int max_h = (i == 1 || i == 2) ? 22 : 16;
+            classic_eq_targets_[i] = 4 + (std::rand() % (max_h - 3));
+        }
+    }
+
+    for (int i = 0; i < kClassicEqBarCount; i++) {
+        if (classic_eq_bars_[i] == nullptr) continue;
+        if (classic_eq_heights_[i] < classic_eq_targets_[i]) {
+            classic_eq_heights_[i] = std::min(classic_eq_heights_[i] + 3, classic_eq_targets_[i]);
+        } else if (classic_eq_heights_[i] > classic_eq_targets_[i]) {
+            classic_eq_heights_[i] = std::max(classic_eq_heights_[i] - 2, classic_eq_targets_[i]);
+        }
+        int h = std::max(3, classic_eq_heights_[i]);
+        lv_obj_set_size(classic_eq_bars_[i], 4, h);
+    }
+}
+
+void OledDisplay::UpdateMusicVisualizer() {
+    if (music_container_ == nullptr) {
+        return;
+    }
+
+    uint32_t now = lv_tick_get();
+    if (now - music_anim_last_update_ > 75) {
+        music_anim_last_update_ = now;
+        music_groove_phase_ = (music_groove_phase_ + 1) % 16;
+
+        bool on_beat = (music_groove_phase_ % 4 == 0);
+        for (int i = 0; i < kMusicEqBarCount; i++) {
+            if (i <= 2) {
+                // Bass section (punchy beat)
+                music_eq_targets_[i] = on_beat ? (16 + (std::rand() % 12)) : (5 + (std::rand() % 9));
+            } else if (i <= 5) {
+                // Mid section (melodic variance)
+                music_eq_targets_[i] = 6 + (std::rand() % 18);
+            } else {
+                // Treble section (rapid dancing)
+                music_eq_targets_[i] = 4 + (std::rand() % 15);
+            }
+            if (music_eq_targets_[i] > 28) music_eq_targets_[i] = 28;
+            if (music_eq_targets_[i] < 4) music_eq_targets_[i] = 4;
+        }
+
+        // Animate decorative side notes
+        if (music_note_left_ != nullptr && music_note_right_ != nullptr) {
+            int note_y = (music_groove_phase_ % 4 < 2) ? 23 : 26;
+            lv_obj_set_pos(music_note_left_, 7, note_y);
+            lv_obj_set_pos(music_note_right_, 113, 49 - note_y);
+        }
+    }
+
+    // Dynamic smoothing: rise fast, decay smoothly
+    for (int i = 0; i < kMusicEqBarCount; i++) {
+        if (music_eq_bars_[i] == nullptr) continue;
+        if (music_eq_heights_[i] < music_eq_targets_[i]) {
+            music_eq_heights_[i] = std::min(music_eq_heights_[i] + 4, music_eq_targets_[i]);
+        } else if (music_eq_heights_[i] > music_eq_targets_[i]) {
+            music_eq_heights_[i] = std::max(music_eq_heights_[i] - 2, music_eq_targets_[i]);
+        }
+        int h = std::max(3, music_eq_heights_[i]);
+        lv_obj_set_size(music_eq_bars_[i], 6, h);
+        lv_obj_set_pos(music_eq_bars_[i], 25 + i * 9, 46 - h);
+    }
+}
+
+void OledDisplay::UpdateFace() {
+    if (height_ != 64 && height_ != 32) {
+        return;
+    }
+
+    if (face_state_ == FaceState::Music) {
+        DisplayLockGuard lock(this);
+        if (music_container_ != nullptr) {
+            UpdateMusicVisualizer();
+            return;
+        }
+        if (!animated_mode_) {
+            UpdateClassicMusicAnimation();
+        } else {
+            MusicBehavior();
+        }
+        return;
+    }
+
+    if (!animated_mode_) {
+        return;
+    }
+
+    if (face_container_ == nullptr) {
+        return;
+    }
+
+    DisplayLockGuard lock(this);
+
+    int eye_height = kEyeSize;
+    if (blink_phase_ == 0) {
+        if (std::rand() % 120 == 0) {
+            blink_phase_ = 1;
+        }
+    }
+
+    switch (blink_phase_) {
+        case 1:
+            eye_height = 4;
+            blink_phase_ = 2;
+            break;
+        case 2:
+            eye_height = 1;
+            blink_phase_ = 3;
+            break;
+        case 3:
+            eye_height = 6;
+            blink_phase_ = 0;
+            break;
+        default:
+            eye_height = kEyeSize;
+            break;
+    }
+
+    switch (face_state_) {
+        case FaceState::Idle:
+            IdleBehavior(eye_height);
+            break;
+        case FaceState::Listening:
+            ListeningBehavior(eye_height);
+            break;
+        case FaceState::Speaking:
+            SpeakingBehavior(eye_height);
+            break;
+        case FaceState::Music:
+            MusicBehavior();
+            break;
+    }
 }
