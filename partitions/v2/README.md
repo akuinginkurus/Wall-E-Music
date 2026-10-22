@@ -1,6 +1,6 @@
 # Version 2 Partition Table
 
-This version introduces significant improvements over v1 by adding an `assets` partition to support network-loadable content and optimizing partition layouts for different flash sizes.
+This version introduces significant improvements over v1 by adding an `assets` partition to support network-loadable content and optimizing partition layouts for different flash sizes. The 4MB ESP32-C3 production layout additionally uses a permanent recovery application so interrupted firmware updates remain recoverable.
 
 ## Key Changes from v1
 
@@ -40,6 +40,16 @@ The `assets` partition stores:
 - `assets`: 8MB (network-loadable assets)
 
 ## Available Configurations
+
+### 4MB ESP32-C3 Production Devices (`4m.csv`)
+- `nvs`: 16KB (bonding, settings, and trusted-device state)
+- `otadata`: 8KB
+- `phy_init`: 4KB
+- `rescue`: 576KB permanent factory recovery
+- `main`: 2688KB signed-update target (`ota_0`)
+- `assets`: 768KB
+
+This is intentionally not a two-slot A/B layout: a full Xiaozhi application does not fit twice in 4MB. Android first switches the device into the small recovery application; recovery then verifies the board, size, SHA-256 digest, and ECDSA P-256 signature before replacing `main`. Power loss during transfer leaves recovery bootable so the update can be retried.
 
 ### 8MB Flash Devices (`8m.csv`)
 - `nvs`: 16KB
