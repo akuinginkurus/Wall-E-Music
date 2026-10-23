@@ -29,8 +29,6 @@
 
 #define TAG "Application"
 
-static WebSettingsServer s_web_settings;
-
 namespace {
 
 std::string ToLowerAscii(std::string text) {
@@ -554,9 +552,9 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
-        static bool web_started = false;
-    if (!web_started) {
-        web_started = s_web_settings.Start(80);
+
+    if (!WebSettingsServer::GetInstance().IsRunning()) {
+        WebSettingsServer::GetInstance().Start(80);
     }
     auto state = GetDeviceState();
 
