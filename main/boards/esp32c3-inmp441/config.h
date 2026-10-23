@@ -10,9 +10,9 @@
 
 // I2S Configuration - Duplex mode with shared clocks
 // ESP32-C3 has only ONE I2S peripheral, mic and speaker share BCLK/WS
-#define AUDIO_I2S_GPIO_MCLK GPIO_NUM_1   // Master Clock (MCLK) for ES8311 (replaces unused battery ADC)
-#define AUDIO_I2S_GPIO_WS   GPIO_NUM_6   // Word Select (shared)
-#define AUDIO_I2S_GPIO_BCLK GPIO_NUM_5   // Bit Clock (shared)
+//#define AUDIO_I2S_GPIO_MCLK GPIO_NUM_1   // Master Clock (MCLK) for ES8311 (replaces unused battery ADC)
+#define AUDIO_I2S_GPIO_WS   GPIO_NUM_9   // Word Select (shared)
+#define AUDIO_I2S_GPIO_BCLK GPIO_NUM_8   // Bit Clock (shared)
 #define AUDIO_I2S_GPIO_DIN  GPIO_NUM_4   // INMP441 SD / WeAct DO (Mic Data In)
 #define AUDIO_I2S_GPIO_DOUT GPIO_NUM_7   // MAX98357A DIN / WeAct DI (Speaker Data Out)
 
@@ -37,7 +37,7 @@
 
 // Vibration Motor / Haptic Configuration (Chronchi notification & find device alarm)
 #ifndef VIBRATION_MOTOR_PIN
-#define VIBRATION_MOTOR_PIN GPIO_NUM_20  // Pin motor getar (Default GPIO 20 pada ESP32-C3 Super Mini)
+#define VIBRATION_MOTOR_PIN GPIO_NUM_1  // Pin motor getar (Default GPIO 20 pada ESP32-C3 Super Mini)
 #endif
 
 // LED Configuration (optional - set to NC if not used)
@@ -50,5 +50,20 @@
 #define DISPLAY_HEIGHT      64
 #define DISPLAY_MIRROR_X    true
 #define DISPLAY_MIRROR_Y    true
+
+// MX1508 dual H-bridge.
+#define MOTOR_LEFT_IN1_PIN GPIO_NUM_5
+#define MOTOR_LEFT_IN2_PIN GPIO_NUM_6
+#define MOTOR_RIGHT_IN1_PIN GPIO_NUM_20
+#define MOTOR_RIGHT_IN2_PIN GPIO_NUM_21
+#define MOTOR_LEFT_INVERT false
+#define MOTOR_RIGHT_INVERT false
+#define MOTOR_PWM_FREQUENCY_HZ 10000
+#define MOTOR_MIN_DUTY_PERCENT 100
+#define MOTOR_MAX_DUTY_PERCENT 100
+#define MOTOR_MAX_RUN_TIME_MS 5000
+#define MOTOR_DIRECTION_DEAD_TIME_MS 120
+#define MOTOR_DUAL_START_STAGGER_MS 40
+
 
 #endif // _BOARD_CONFIG_H_
