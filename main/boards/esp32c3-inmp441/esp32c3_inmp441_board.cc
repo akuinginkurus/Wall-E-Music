@@ -25,6 +25,7 @@
 #include "mode/mode_store.h"
 #include "settings.h"
 #include "youtube_audio_poller.h"
+#include "motor_controller.h"
 
 #include <esp_err.h>
 #include <esp_log.h>
@@ -50,6 +51,7 @@ private:
     bool boot_button_pressed_ = false;
     bool youtube_interrupted_ = false;
     DeviceState last_observed_state_ = kDeviceStateUnknown;
+    MotorController* motor_controller_ = nullptr;
 
     bool is_es8311_detected_ = false;
     uint8_t es8311_addr_ = AUDIO_ES8311_I2C_ADDR;
@@ -378,6 +380,8 @@ public:
                 });
             InitializeButtons();
             InitializeHandsFreeMode();
+            motor_controller_ = new MotorController(MOTOR_LEFT_IN1_PIN, MOTOR_LEFT_IN2_PIN,
+                                                MOTOR_RIGHT_IN1_PIN, MOTOR_RIGHT_IN2_PIN);
         }
     }
 
