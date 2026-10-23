@@ -11,7 +11,7 @@
 #include "settings.h"
 #include "mode/mode_store.h"
 #include "youtube_audio_poller.h"
-
+#include "web_settings_server.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -28,6 +28,8 @@
 #include <vector>
 
 #define TAG "Application"
+
+static WebSettingsServer s_web_settings;
 
 namespace {
 
@@ -552,6 +554,10 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+        static bool web_started = false;
+    if (!web_started) {
+        web_started = s_web_settings.Start(80);
+    }
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
