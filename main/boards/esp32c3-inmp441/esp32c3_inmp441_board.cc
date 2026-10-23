@@ -19,6 +19,7 @@
 #include "application.h"
 #include "adc_battery_monitor.h"
 #include "button.h"
+#include "led/gpio_led.h"
 #include "config.h"
 #include "shared_oled.h"
 #include "mode/mode_selector.h"
@@ -299,6 +300,13 @@ private:
         wait_for_wake_word_ = false;
 #endif
     }
+
+    void InitializeListeningLed() {
+        gpio_reset_pin(GPIO_NUM_12);
+        ESP_ERROR_CHECK(
+            gpio_set_direction(GPIO_NUM_12, GPIO_MODE_OUTPUT));
+        gpio_set_level(GPIO_NUM_12, 1);
+}
 
     void InitializeHandsFreeMode() {
 #if HANDS_FREE_AUTO_LISTEN
