@@ -11,7 +11,7 @@
 // I2S Configuration - Duplex mode with shared clocks
 // ESP32-C3 has only ONE I2S peripheral, mic and speaker share BCLK/WS
 #define AUDIO_I2S_GPIO_MCLK GPIO_NUM_1    // Master Clock (MCLK) for ES8311 (replaces unused battery ADC)
-#define AUDIO_I2S_GPIO_WS   GPIO_NUM_12   // Word Select (shared)
+#define AUDIO_I2S_GPIO_WS   GPIO_NUM_11   // Word Select (shared)
 #define AUDIO_I2S_GPIO_BCLK GPIO_NUM_18   // Bit Clock (shared)
 #define AUDIO_I2S_GPIO_DIN  GPIO_NUM_19   // INMP441 SD / WeAct DO (Mic Data In)
 #define AUDIO_I2S_GPIO_DOUT GPIO_NUM_13   // MAX98357A DIN / WeAct DI (Speaker Data Out)
